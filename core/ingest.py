@@ -75,10 +75,11 @@ class RepositoryIngestor:
     def should_process_file(self, file_path: str) -> bool:
         """
         Determine if a file should be processed based on extension and ignore rules.
+        Updated to handle large files with chunking.
         
         Args:
             file_path: Path to the file
-            
+                
         Returns:
             True if the file should be processed, False otherwise
         """
@@ -89,15 +90,6 @@ class RepositoryIngestor:
         
         # Check if it's a directory
         if os.path.isdir(os.path.join(self.repo_path, file_path)):
-            return False
-        
-        # Check file size
-        full_path = os.path.join(self.repo_path, file_path)
-        try:
-            if os.path.getsize(full_path) > MAX_FILE_SIZE:
-                logger.warning(f"Skipping large file: {file_path} ({os.path.getsize(full_path) / 1024:.1f}KB)")
-                return False
-        except (FileNotFoundError, OSError):
             return False
         
         # Check file extension
@@ -128,6 +120,65 @@ class RepositoryIngestor:
         
         return all_files
     
+    def _chunk_large_file(self, file_path: str, max_chunk_size: int = 100 * 1024) -> Optional[str]:
+        """
+        Process a large file by reading it in chunks.
+        
+        Args:
+            file_path: Path to the file
+            max_chunk_size: Maximum chunk size in bytes
+            
+        Returns:
+            File content as a string, or None if the file couldn't be read
+        """
+        full_path = os.path.join(self.repo_path, file_path)
+        
+        try:
+            file_size = os.path.getsize(full_path)
+            
+            # For text files, read in chunks
+            chunks = []
+            total_bytes_read = 0
+            max_chunks = 10  # Limit the number of chunks to prevent excessive memory usage
+            
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                while total_bytes_read < file_size and len(chunks) < max_chunks:
+                    chunk = f.read(max_chunk_size)
+                    if not chunk:
+                        break
+                        
+                    chunks.append(chunk)
+                    total_bytes_read += len(chunk.encode('utf-8'))
+                    
+                    # If we've read enough, break
+                    if total_bytes_read >= 1000000:  # 1MB limit
+                        chunks.append("\n... [file truncated due to size] ...")
+                        break
+            
+            # Combine chunks
+            content = ''.join(chunks)
+            logger.info(f"Processed large file {file_path} ({total_bytes_read / 1024:.1f}KB of {file_size / 1024:.1f}KB)")
+            
+            return content
+            
+        except UnicodeDecodeError:
+            try:
+                # Fallback to latin-1 encoding
+                chunks = []
+                with open(full_path, 'r', encoding='latin-1', errors='replace') as f:
+                    while len(chunks) < max_chunks:
+                        chunk = f.read(max_chunk_size)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                return ''.join(chunks)
+            except Exception as e:
+                logger.warning(f"Failed to read large file {file_path}: {str(e)}")
+                return None
+        except Exception as e:
+            logger.warning(f"Failed to read large file {file_path}: {str(e)}")
+            return None
+    
     def extract_file_content(self, file_path: str) -> Optional[str]:
         """
         Extract the content of a file.
@@ -140,6 +191,14 @@ class RepositoryIngestor:
         """
         full_path = os.path.join(self.repo_path, file_path)
         
+        # Check if it's a large file
+        try:
+            if os.path.getsize(full_path) > MAX_FILE_SIZE:
+                return self._chunk_large_file(file_path)
+        except (FileNotFoundError, OSError):
+            return None
+        
+        # Handle normal-sized files as before
         try:
             with open(full_path, 'r', encoding='utf-8') as f:
                 return f.read()

@@ -154,8 +154,67 @@ class RepositoryDB:
                     else:
                         self.db.create_collection(name)
                     logger.info(f"Created collection: {name}")
+            
+            # Create indexes for improved query performance
+            self._ensure_indexes()
+            
         except Exception as e:
             logger.error(f"Error creating collections: {str(e)}")
+    
+    def _ensure_indexes(self) -> None:
+        """Ensure all necessary indexes exist in the database."""
+        if not self.db:
+            return
+            
+        try:
+            # Index for repositories collection
+            repo_collection = self.db.collection('repositories')
+            self._create_index_if_not_exists(repo_collection, ['path'], unique=True)
+            
+            # Indexes for files collection
+            files_collection = self.db.collection('files')
+            self._create_index_if_not_exists(files_collection, ['repo_id'])
+            self._create_index_if_not_exists(files_collection, ['repo_id', 'path'])
+            
+            # Indexes for functions collection
+            functions_collection = self.db.collection('functions')
+            self._create_index_if_not_exists(functions_collection, ['repo_id'])
+            self._create_index_if_not_exists(functions_collection, ['repo_id', 'file_path'])
+            self._create_index_if_not_exists(functions_collection, ['name'])
+            
+            # Indexes for classes collection
+            classes_collection = self.db.collection('classes')
+            self._create_index_if_not_exists(classes_collection, ['repo_id'])
+            self._create_index_if_not_exists(classes_collection, ['repo_id', 'file_path'])
+            self._create_index_if_not_exists(classes_collection, ['name'])
+            
+            # Index for embeddings collection
+            embeddings_collection = self.db.collection('embeddings')
+            self._create_index_if_not_exists(embeddings_collection, ['repo_id'])
+            self._create_index_if_not_exists(embeddings_collection, ['file_id'])
+            
+            logger.info("Database indexes verified")
+            
+        except Exception as e:
+            logger.error(f"Error ensuring indexes: {str(e)}")
+    
+    def _create_index_if_not_exists(self, collection, fields, unique=False, sparse=False):
+        """Create an index on a collection if it doesn't already exist."""
+        try:
+            # Check if index already exists
+            existing_indexes = collection.indexes()
+            
+            for idx in existing_indexes:
+                if idx['type'] == 'hash' and set(idx['fields']) == set(fields):
+                    # Index already exists
+                    return
+            
+            # Create the index
+            collection.add_hash_index(fields=fields, unique=unique, sparse=sparse)
+            logger.info(f"Created index on {collection.name}: {fields}")
+            
+        except Exception as e:
+            logger.error(f"Error creating index on {collection.name}: {str(e)}")
     
     def _initialize_graphs(self) -> None:
         """Initialize graphs in the database."""
