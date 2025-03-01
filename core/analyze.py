@@ -125,30 +125,6 @@ class RepositoryAnalyzer:
         # Use content field
         return file_entry.get('content', '')
     
-    def _compute_simple_embedding(self, text: str) -> List[float]:
-        """
-        Compute a simple embedding for text using a hashing method.
-        This is a fallback when OpenAI API is not available.
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            List of floats representing the embedding
-        """
-        # Create a hash from the text
-        hash_obj = hashlib.md5(text.encode())
-        hash_bytes = hash_obj.digest()
-        
-        # Use the hash to seed numpy's random number generator
-        np.random.seed(int.from_bytes(hash_bytes[:4], byteorder='little'))
-        
-        # Generate a random vector of specific dimensions (e.g., 1536 for text-embedding-3-small)
-        dimensions = 1536
-        embedding = np.random.normal(0, 1, dimensions).tolist()
-        
-        return embedding
-    
     async def _generate_embedding_openai(self, text: str) -> List[float]:
         """
         Generate an embedding using OpenAI's API.
@@ -160,7 +136,8 @@ class RepositoryAnalyzer:
             List of floats representing the embedding
         """
         if not self.openai_client:
-            return self._compute_simple_embedding(text)
+            logger.warning("OpenAI client not available, falling back to Supabase")
+            return []
         
         try:
             response = await asyncio.to_thread(
@@ -171,7 +148,7 @@ class RepositoryAnalyzer:
             return response.data[0].embedding
         except Exception as e:
             logger.warning(f"OpenAI embedding generation failed: {str(e)}")
-            return self._compute_simple_embedding(text)
+            return []
     
     async def _generate_embedding_supabase(self, text: str) -> List[float]:
         """
@@ -341,9 +318,10 @@ class RepositoryAnalyzer:
         """
         logger.info(f"Generating embeddings for repository: {self.repo_data.get('name', 'unknown')}")
         
-        # Check if OpenAI API is available
+        # Check if embedding services are available
         if not self.openai_client and not self.supabase:
-            logger.warning("OpenAI API and Supabase not available, using simple embedding instead")
+            logger.error("Neither OpenAI API nor Supabase are available for embedding generation")
+            raise ValueError("No embedding service available")
         
         # Try to load existing embeddings
         embeddings_path = os.path.join(self.output_dir, 'embeddings_cache.json')
