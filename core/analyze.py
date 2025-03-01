@@ -1,684 +1,748 @@
 """
-Analysis module for PromptPilot.
+Repository analysis module for PromptPilot.
 
-This module handles generating embeddings and analyzing code structure.
+This module handles generating embeddings for code files and analyzing the
+code structure to identify key concepts and relationships between files.
 """
 
 import os
 import json
-import logging
-from typing import Dict, List, Any, Optional, Tuple
-from collections import defaultdict
-import time
-import numpy as np
-from tqdm import tqdm
-from sklearn.metrics.pairwise import cosine_similarity
-import openai
 import hashlib
 import asyncio
-import re
-import random
+import logging
+from typing import List, Dict, Any, Optional, Tuple, Set, Callable, Coroutine
+from pathlib import Path
+from datetime import datetime, timezone
+import numpy as np
+import time
+from tqdm.asyncio import tqdm_asyncio
+from dotenv import load_dotenv
+from supabase import create_client, Client
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('promptpilot.analyze')
 
-# Default embedding model
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+# Load environment variables
+load_dotenv()
+
+try:
+    import openai
+except ImportError:
+    openai = None
+    logger.warning("OpenAI package not installed, will use simple embedding instead")
 
 
 class RepositoryAnalyzer:
-    """Class to analyze repository content and generate embeddings."""
+    """Class to analyze a repository and generate embeddings for code files."""
     
-    def __init__(self, repository_dir: str, embedding_model: str = DEFAULT_EMBEDDING_MODEL):
+    def __init__(self, 
+                 repo_data_path: str,
+                 output_dir: Optional[str] = None,
+                 embedding_model: str = "text-embedding-3-small",
+                 chunk_size: int = 4000,
+                 use_supabase: bool = True):
         """
         Initialize the repository analyzer.
         
         Args:
-            repository_dir: Directory containing repository data (.promptpilot folder)
-            embedding_model: OpenAI embedding model to use
+            repo_data_path: Path to the repository data JSON file
+            output_dir: Directory to store analysis data
+            embedding_model: Name of the embedding model to use
+            chunk_size: Maximum number of tokens per chunk
+            use_supabase: Whether to use Supabase for embedding generation and storage
         """
-        self.repository_dir = repository_dir
+        self.repo_data_path = os.path.abspath(repo_data_path)
+        
+        # Load repository data
+        with open(self.repo_data_path, 'r', encoding='utf-8') as f:
+            self.repo_data = json.load(f)
+        
+        # Set output directory
+        repo_dir = os.path.dirname(self.repo_data_path)
+        self.output_dir = os.path.abspath(output_dir) if output_dir else repo_dir
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Set embedding model name
         self.embedding_model = embedding_model
+        self.chunk_size = chunk_size
+        self.openai_client = None
+        self.use_supabase = use_supabase
+        self.supabase = None
         
-        # Check if repository data exists
-        self.data_path = os.path.join(repository_dir, 'repository_data.json')
-        if not os.path.exists(self.data_path):
-            raise FileNotFoundError(f"Repository data not found at {self.data_path}")
-        
-        # Output paths
-        self.embeddings_path = os.path.join(repository_dir, 'embeddings.json')
-        self.analysis_path = os.path.join(repository_dir, 'analysis.json')
-        
-        # Initialize OpenAI client
-        self.api_key = os.environ.get('OPENAI_API_KEY')
-        if not self.api_key:
-            logger.warning("OPENAI_API_KEY not found in environment variables")
-            logger.warning("Embeddings will not be generated")
-            self.client = None
-            self.openai_available = False
-        else:
-            # Initialize OpenAI client using the successful approach from our test
+        # Initialize API clients
+        if openai and os.environ.get("OPENAI_API_KEY") and not self.use_supabase:
             try:
-                from openai import OpenAI, AsyncOpenAI
-                self.client = OpenAI(api_key=self.api_key)
-                self.async_client = AsyncOpenAI(api_key=self.api_key)
-                self.openai_available = True
-                logger.info(f"OpenAI client initialized with model: {embedding_model}")
+                self.openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+                logger.info(f"Using OpenAI embedding model: {embedding_model}")
             except Exception as e:
-                logger.error(f"Failed to initialize OpenAI client: {e}")
-                self.client = None
-                self.openai_available = False
-                logger.warning("Embeddings will use fallback generation")
-    
-    def _load_repository_data(self) -> Dict[str, Any]:
-        """
-        Load repository data from disk.
+                logger.warning(f"Failed to initialize OpenAI client: {str(e)}")
+                self.openai_client = None
         
-        Returns:
-            Repository data dictionary
-        """
-        with open(self.data_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        # Initialize Supabase client if requested
+        if self.use_supabase:
+            supabase_url = os.environ.get("SUPABASE_URL")
+            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+            
+            if supabase_url and supabase_key:
+                try:
+                    self.supabase = create_client(supabase_url, supabase_key)
+                    logger.info("Supabase client initialized for embedding generation and storage")
+                except Exception as e:
+                    logger.error(f"Failed to initialize Supabase client: {e}")
+                    self.supabase = None
+            else:
+                logger.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set, falling back to OpenAI")
+                self.use_supabase = False
     
-    def _save_embeddings(self, embeddings: Dict[str, List[float]]) -> None:
+    def _get_file_content(self, file_entry: Dict[str, Any]) -> str:
         """
-        Save embeddings to disk.
+        Get the content of a file.
         
         Args:
-            embeddings: Dictionary mapping file paths to embedding vectors
-        """
-        with open(self.embeddings_path, 'w', encoding='utf-8') as f:
-            json.dump(embeddings, f)
-        
-        logger.info(f"Embeddings saved to {self.embeddings_path}")
-    
-    def _save_analysis(self, analysis: Dict[str, Any]) -> None:
-        """
-        Save analysis results to disk.
-        
-        Args:
-            analysis: Analysis results dictionary
-        """
-        with open(self.analysis_path, 'w', encoding='utf-8') as f:
-            json.dump(analysis, f, indent=2)
-        
-        logger.info(f"Analysis saved to {self.analysis_path}")
-    
-    async def get_embedding_async(self, content: str, client) -> List[float]:
-        """
-        Get embedding from OpenAI API asynchronously.
-        
-        Args:
-            content: Text content to embed
-            client: Async OpenAI client
+            file_entry: Dictionary containing file information
             
         Returns:
-            Embedding vector
+            File content as a string
         """
+        # Try to get content from content_url if available
+        if file_entry.get('content_url') and self.supabase:
+            try:
+                # Extract filename from content_url
+                url_parts = file_entry['content_url'].split('/')
+                filename = url_parts[-1]
+                
+                # Download content from Supabase
+                data = self.supabase.storage.from_("file_contents").download(filename)
+                return data.decode('utf-8')
+            except Exception as e:
+                logger.warning(f"Failed to download content from Supabase: {str(e)}")
+                # Fall back to content field
+        
+        # Use content field
+        return file_entry.get('content', '')
+    
+    def _compute_simple_embedding(self, text: str) -> List[float]:
+        """
+        Compute a simple embedding for text using a hashing method.
+        This is a fallback when OpenAI API is not available.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            List of floats representing the embedding
+        """
+        # Create a hash from the text
+        hash_obj = hashlib.md5(text.encode())
+        hash_bytes = hash_obj.digest()
+        
+        # Use the hash to seed numpy's random number generator
+        np.random.seed(int.from_bytes(hash_bytes[:4], byteorder='little'))
+        
+        # Generate a random vector of specific dimensions (e.g., 1536 for text-embedding-3-small)
+        dimensions = 1536
+        embedding = np.random.normal(0, 1, dimensions).tolist()
+        
+        return embedding
+    
+    async def _generate_embedding_openai(self, text: str) -> List[float]:
+        """
+        Generate an embedding using OpenAI's API.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            List of floats representing the embedding
+        """
+        if not self.openai_client:
+            return self._compute_simple_embedding(text)
+        
         try:
-            response = await client.embeddings.create(
-                model=self.embedding_model,
-                input=content
+            response = await asyncio.to_thread(
+                self.openai_client.embeddings.create,
+                input=text,
+                model=self.embedding_model
             )
             return response.data[0].embedding
         except Exception as e:
-            logger.error(f"Async embedding API error: {e}")
-            # Return None to allow fallback to mock embedding
-            return None
-
-    def _generate_simple_embedding(self, content: str) -> List[float]:
-        """
-        Generate a simple embedding based on hash of content (for fallback).
-        This is used when OpenAI API is not available or fails.
-        
-        Args:
-            content: Text content to embed
-            
-        Returns:
-            Mock embedding vector (1536 dimensions)
-        """
-        logger.info("Generating mock embedding as fallback")
-        
-        # Use hash of content to seed a deterministic random embedding
-        import hashlib
-        import random
-        
-        # Generate a stable hash from the content
-        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
-        
-        # Use the hash to seed a random number generator for deterministic output
-        random.seed(content_hash)
-        
-        # Generate 1536 values (OpenAI embedding size) between -1 and 1
-        mock_embedding = [random.uniform(-1, 1) for _ in range(1536)]
-        
-        # Normalize to unit vector
-        norm = sum(x*x for x in mock_embedding) ** 0.5
-        if norm > 0:
-            mock_embedding = [x/norm for x in mock_embedding]
-            
-        logger.warning("Using mock embedding. Similarity calculations will not be meaningful.")
-        return mock_embedding
-        
-    async def _process_file_batch(self, files_batch, client):
-        """Process a batch of files concurrently."""
-        tasks = []
-        for file_path, content, content_hash in files_batch:
-            # Skip empty files
-            if not content.strip():
-                continue
-                
-            # Truncate content if too long
-            if len(content) > 32000:
-                logger.warning(f"Truncating {file_path} for embedding (too long)")
-                content = content[:32000]
-                
-            # Create task
-            task = asyncio.create_task(
-                self.get_embedding_async(content, client)
-            )
-            tasks.append((file_path, content_hash, task))
-        
-        # Wait for all embeddings to complete
-        results = []
-        for file_path, content_hash, task in tasks:
-            try:
-                embedding = await task
-                if embedding is not None:  # Only add successful embeddings
-                    results.append((file_path, content_hash, embedding))
-                else:
-                    # If API fails, generate a simple embedding
-                    try:
-                        with open(os.path.join(os.path.dirname(self.repository_dir), file_path), 'r', encoding='utf-8') as f:
-                            content = f.read()
-                        simple_embedding = self._generate_simple_embedding(content)
-                        results.append((file_path, content_hash, simple_embedding))
-                        logger.warning(f"Using simple embedding for {file_path} due to API error")
-                    except Exception as e:
-                        logger.error(f"Could not generate simple embedding for {file_path}: {e}")
-            except Exception as e:
-                logger.error(f"Error processing {file_path}: {str(e)}")
-        
-        return results
-
-    async def generate_embeddings_async(self, files_to_process: List[Tuple[str, str, str]]) -> Tuple[Dict[str, List[float]], Dict[str, str]]:
-        """
-        Generate embeddings for files asynchronously.
-        
-        Args:
-            files_to_process: List of (file_path, content, content_hash) tuples
-                
-        Returns:
-            Tuple of (embeddings dict, cache metadata dict)
-        """
-        embeddings = {}
-        cache_metadata = {}
-        
-        # Use the pre-initialized async client
-        client = self.async_client
-        
-        # Process files in batches to control concurrency
-        batch_size = 5  # Adjust based on rate limits
-        batches = [files_to_process[i:i+batch_size] for i in range(0, len(files_to_process), batch_size)]
-        
-        for batch in tqdm(batches, desc="Generating embeddings (batched)"):
-            batch_results = await self._process_file_batch(batch, client)
-            
-            # Process results
-            for file_path, content_hash, embedding in batch_results:
-                embeddings[file_path] = embedding
-                cache_metadata[file_path] = content_hash
-            
-            # Add a small delay between batches to avoid rate limits
-            await asyncio.sleep(0.5)
-        
-        return embeddings, cache_metadata
+            logger.warning(f"OpenAI embedding generation failed: {str(e)}")
+            return self._compute_simple_embedding(text)
     
-    def generate_embeddings(self, repo_data: Dict[str, Any]) -> Dict[str, List[float]]:
+    async def _generate_embedding_supabase(self, text: str) -> List[float]:
         """
-        Generate embeddings for each file in the repository with caching.
-        Now with async support for faster processing.
+        Generate an embedding using Supabase's pgvector.
         
         Args:
-            repo_data: Repository data dictionary
-                
+            text: Input text
+            
         Returns:
-            Dictionary mapping file paths to embedding vectors
+            List of floats representing the embedding
         """
-        embeddings = {}
+        if not self.supabase:
+            return await self._generate_embedding_openai(text)
+        
+        try:
+            # Use Supabase's Edge Function to generate embedding
+            response = await asyncio.to_thread(
+                self.supabase.functions.invoke,
+                "generate-embeddings",
+                {"text": text}
+            )
+            
+            if response and "embedding" in response:
+                return response["embedding"]
+            else:
+                logger.warning("Supabase embedding generation returned invalid response")
+                return await self._generate_embedding_openai(text)
+                
+        except Exception as e:
+            logger.warning(f"Supabase embedding generation failed: {str(e)}")
+            return await self._generate_embedding_openai(text)
+    
+    async def _generate_embedding(self, text: str) -> List[float]:
+        """
+        Generate an embedding for text.
+        
+        Args:
+            text: Input text
+            
+        Returns:
+            List of floats representing the embedding
+        """
+        if self.use_supabase and self.supabase:
+            return await self._generate_embedding_supabase(text)
+        else:
+            return await self._generate_embedding_openai(text)
+    
+    def _hash_content(self, content: str) -> str:
+        """
+        Generate a hash for content to detect changes.
+        
+        Args:
+            content: File content
+            
+        Returns:
+            Hash string
+        """
+        return hashlib.md5(content.encode('utf-8')).hexdigest()
+    
+    def _chunk_content(self, content: str, max_length: int = 4000) -> List[str]:
+        """
+        Split content into chunks for embedding.
+        
+        Args:
+            content: File content
+            max_length: Maximum length of each chunk
+            
+        Returns:
+            List of content chunks
+        """
+        if len(content) <= max_length:
+            return [content]
+        
+        # Split by lines first
+        lines = content.splitlines()
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for line in lines:
+            line_length = len(line) + 1  # +1 for newline
+            
+            if current_length + line_length > max_length and current_chunk:
+                # Save current chunk
+                chunks.append('\n'.join(current_chunk))
+                current_chunk = [line]
+                current_length = line_length
+            else:
+                # Add to current chunk
+                current_chunk.append(line)
+                current_length += line_length
+        
+        # Add the last chunk
+        if current_chunk:
+            chunks.append('\n'.join(current_chunk))
+        
+        return chunks
+    
+    def _store_embeddings_to_supabase(self, embeddings_data: Dict[str, Any]) -> bool:
+        """
+        Store embeddings data to Supabase.
+        
+        Args:
+            embeddings_data: Dictionary containing embedding information
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.supabase:
+            return False
+            
+        try:
+            # Prepare data for insertion
+            repository_id = embeddings_data.get('repository_id', str(uuid.uuid4()))
+            repository_name = self.repo_data.get('name', 'unnamed')
+            
+            # Store repository record
+            repo_result = self.supabase.table('repositories').upsert({
+                'id': repository_id,
+                'name': repository_name,
+                'path': self.repo_data.get('path', ''),
+                'file_count': self.repo_data.get('file_count', 0),
+                'processed_date': datetime.now().isoformat()
+            }).execute()
+            
+            # Store file embeddings
+            for file_path, file_data in embeddings_data.get('files', {}).items():
+                for i, chunk_data in enumerate(file_data.get('chunks', [])):
+                    # Prepare embedding record
+                    embedding_record = {
+                        'id': str(uuid.uuid4()),
+                        'repository_id': repository_id,
+                        'file_path': file_path,
+                        'chunk_index': i,
+                        'content': chunk_data.get('content', ''),
+                        'embedding': chunk_data.get('embedding', []),
+                        'content_hash': chunk_data.get('hash', ''),
+                        'metadata': {
+                            'file_size': file_data.get('metadata', {}).get('size_bytes', 0),
+                            'extension': file_data.get('metadata', {}).get('extension', ''),
+                            'lines': file_data.get('lines', 0)
+                        }
+                    }
+                    
+                    # Insert embedding record
+                    self.supabase.table('file_embeddings').upsert(
+                        embedding_record,
+                        on_conflict='id'
+                    ).execute()
+            
+            logger.info(f"Successfully stored embeddings for {repository_name} in Supabase")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to store embeddings in Supabase: {e}")
+            return False
+    
+    async def generate_embeddings(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Generate embeddings for all files in the repository.
+        
+        Args:
+            force_refresh: Whether to force regeneration of all embeddings
+            
+        Returns:
+            Dictionary containing embedding information
+        """
+        logger.info(f"Generating embeddings for repository: {self.repo_data.get('name', 'unknown')}")
         
         # Check if OpenAI API is available
-        if not self.openai_available:
-            logger.warning("OpenAI API not available, using simple embeddings")
-            # Generate simple embeddings for all files
-            for file_entry in repo_data['files']:
-                file_path = file_entry['metadata']['path']
-                content = file_entry['content']
-                embeddings[file_path] = self._generate_simple_embedding(content)
-            return embeddings
-            
-        # Check for cache file
-        cache_path = os.path.join(self.repository_dir, 'embeddings_cache.json')
-        cache_metadata_path = os.path.join(self.repository_dir, 'embeddings_cache_metadata.json')
+        if not self.openai_client and not self.supabase:
+            logger.warning("OpenAI API and Supabase not available, using simple embedding instead")
         
-        # Try to load from cache
-        cache_exists = os.path.exists(cache_path)
-        cache_valid = False
-        cache_metadata = {}
+        # Try to load existing embeddings
+        embeddings_path = os.path.join(self.output_dir, 'embeddings_cache.json')
+        embeddings_metadata_path = os.path.join(self.output_dir, 'embeddings_cache_metadata.json')
         
-        if cache_exists:
+        embeddings_data = {
+            'repository_id': str(uuid.uuid4()),
+            'model': self.embedding_model,
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'files': {}
+        }
+        
+        # Load existing cache if available
+        if os.path.exists(embeddings_path) and os.path.exists(embeddings_metadata_path) and not force_refresh:
             try:
-                with open(cache_path, 'r', encoding='utf-8') as f:
-                    embeddings = json.load(f)
-                    
-                with open(cache_metadata_path, 'r', encoding='utf-8') as f:
+                with open(embeddings_path, 'r', encoding='utf-8') as f:
+                    cached_embeddings = json.load(f)
+                
+                with open(embeddings_metadata_path, 'r', encoding='utf-8') as f:
                     cache_metadata = json.load(f)
+                
+                # Check if the cache is valid
+                if cache_metadata.get('model') == self.embedding_model:
+                    embeddings_data = cached_embeddings
+                    logger.info(f"Loaded existing embeddings cache from {embeddings_path}")
                     
-                logger.info(f"Loaded {len(embeddings)} embeddings from cache")
-                cache_valid = True
+                    # Keep existing repository ID
+                    if 'repository_id' in cache_metadata:
+                        embeddings_data['repository_id'] = cache_metadata['repository_id']
+            
             except Exception as e:
-                logger.warning(f"Failed to load embeddings cache: {e}")
-                embeddings = {}
-                cache_metadata = {}
+                logger.warning(f"Failed to load embeddings cache: {str(e)}")
         
-        # Prepare files to process
+        # Get the list of files to process
         files_to_process = []
-        cache_hits = 0
+        content_hashes = {}
         
-        for file_entry in repo_data['files']:
-            file_path = file_entry['metadata']['path']
-            content = file_entry['content']
-            content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+        for file_entry in self.repo_data.get('files', []):
+            file_path = file_entry.get('metadata', {}).get('path', '')
             
-            # Skip if in cache and content hasn't changed
-            if cache_valid and file_path in embeddings and file_path in cache_metadata:
-                if cache_metadata[file_path] == content_hash:
-                    cache_hits += 1
-                    continue
+            if not file_path:
+                continue
             
-            # Add to processing list
-            files_to_process.append((file_path, content, content_hash))
+            # Get file content
+            content = self._get_file_content(file_entry)
+            
+            if not content:
+                continue
+            
+            # Compute content hash
+            content_hash = self._hash_content(content)
+            content_hashes[file_path] = content_hash
+            
+            # Check if we need to process this file
+            need_processing = True
+            
+            # Skip if the file is already in the cache and the content hasn't changed
+            if file_path in embeddings_data.get('files', {}) and not force_refresh:
+                cached_hash = embeddings_data['files'][file_path].get('hash')
+                if cached_hash == content_hash:
+                    need_processing = False
+                    logger.debug(f"Skipping unchanged file: {file_path}")
+            
+            if need_processing:
+                files_to_process.append((file_path, content, file_entry))
         
-        if cache_hits > 0:
-            logger.info(f"Using {cache_hits} cached embeddings (cache hit rate: {cache_hits/len(repo_data['files']):.1%})")
-        
-        # Process files that need new embeddings
+        # Generate embeddings for files that need processing
         if files_to_process:
             logger.info(f"Generating embeddings for {len(files_to_process)} files")
             
-            try:
-                # Try to use async version
-                # Get event loop or create one
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+            # Create embedding tasks
+            tasks = []
+            
+            for file_path, content, file_entry in files_to_process:
+                # Split content into chunks
+                chunks = self._chunk_content(content, self.chunk_size)
                 
-                # Run async embedding generation
-                new_embeddings, new_cache_metadata = loop.run_until_complete(
-                    self.generate_embeddings_async(files_to_process)
-                )
+                # Create tasks for embedding generation
+                for chunk in chunks:
+                    tasks.append((file_path, chunk, content_hashes[file_path], file_entry))
+            
+            # Process tasks in parallel
+            chunk_results = []
+            
+            async def process_chunk(task_data):
+                file_path, chunk_content, content_hash, file_entry = task_data
+                embedding = await self._generate_embedding(chunk_content)
+                return {
+                    'file_path': file_path,
+                    'content': chunk_content,
+                    'hash': content_hash,
+                    'embedding': embedding,
+                    'file_entry': file_entry
+                }
+            
+            # Run tasks with progress bar
+            async_tasks = [process_chunk(task) for task in tasks]
+            for result in await tqdm_asyncio.gather(*async_tasks, desc="Generating embeddings"):
+                chunk_results.append(result)
+            
+            # Organize results by file
+            for result in chunk_results:
+                file_path = result['file_path']
+                file_entry = result['file_entry']
                 
-                # Update embeddings and cache metadata
-                embeddings.update(new_embeddings)
-                cache_metadata.update(new_cache_metadata)
+                # Initialize file entry if needed
+                if file_path not in embeddings_data['files']:
+                    embeddings_data['files'][file_path] = {
+                        'metadata': file_entry.get('metadata', {}),
+                        'hash': result['hash'],
+                        'lines': file_entry.get('lines', 0),
+                        'chunks': []
+                    }
                 
-                logger.info(f"Generated {len(new_embeddings)} embeddings asynchronously")
-                
-            except Exception as e:
-                logger.warning(f"Async embedding generation failed: {e}. Falling back to sync version.")
-                
-                # Fall back to synchronous version using the pre-initialized client
-                for file_path, content, content_hash in tqdm(files_to_process, desc="Generating embeddings"):
-                    try:
-                        # Skip empty files
-                        if not content.strip():
-                            continue
-                        
-                        # Truncate content if too long
-                        if len(content) > 32000:
-                            logger.warning(f"Truncating {file_path} for embedding (too long)")
-                            content = content[:32000]
-                        
-                        # Generate embedding
-                        response = self.client.embeddings.create(
-                            input=content,
-                            model=self.embedding_model
-                        )
-                        
-                        # Extract embedding
-                        embedding = response.data[0].embedding
-                        embeddings[file_path] = embedding
-                        
-                        # Update cache metadata
-                        cache_metadata[file_path] = content_hash
-                        
-                        # Rate limiting
-                        time.sleep(0.1)
-                        
-                    except Exception as e:
-                        logger.error(f"Error generating embedding for {file_path}: {str(e)}")
-                        # Use simple embedding as fallback
-                        embeddings[file_path] = self._generate_simple_embedding(content)
-                        cache_metadata[file_path] = content_hash
-        
-        # Save updated cache
-        try:
-            with open(cache_path, 'w', encoding='utf-8') as f:
-                json.dump(embeddings, f)
-                
-            with open(cache_metadata_path, 'w', encoding='utf-8') as f:
+                # Add chunk data
+                embeddings_data['files'][file_path]['chunks'].append({
+                    'content': result['content'],
+                    'embedding': result['embedding'],
+                    'hash': result['hash']
+                })
+            
+            # Save embeddings to disk
+            with open(embeddings_path, 'w', encoding='utf-8') as f:
+                json.dump(embeddings_data, f)
+            
+            # Save metadata
+            cache_metadata = {
+                'model': self.embedding_model,
+                'generated_at': datetime.now(timezone.utc).isoformat(),
+                'file_count': len(embeddings_data['files']),
+                'repository_id': embeddings_data.get('repository_id')
+            }
+            
+            with open(embeddings_metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(cache_metadata, f)
-                
-            logger.info(f"Saved {len(embeddings)} embeddings to cache")
+            
+            logger.info(f"Embeddings saved to {embeddings_path}")
+        else:
+            logger.info("No files need embedding updates")
+        
+        # Store embeddings in Supabase if enabled
+        if self.use_supabase and self.supabase:
+            self._store_embeddings_to_supabase(embeddings_data)
+        
+        return embeddings_data
+    
+    def find_similar_files(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Find files similar to a query using embeddings.
+        
+        Args:
+            query: Query text
+            top_k: Number of results to return
+            
+        Returns:
+            List of similar files with scores and metadata
+        """
+        # First, try to use Supabase for similarity search
+        if self.use_supabase and self.supabase:
+            try:
+                results = self._search_similar_supabase(query, top_k)
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"Supabase similarity search failed: {str(e)}")
+        
+        # Fall back to local similarity search
+        return self._search_similar_local(query, top_k)
+    
+    async def _search_similar_supabase(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Search for similar files using Supabase's pgvector.
+        
+        Args:
+            query: Query text
+            top_k: Number of results to return
+            
+        Returns:
+            List of similar files with scores and metadata
+        """
+        if not self.supabase:
+            return []
+            
+        try:
+            # Generate embedding for the query
+            query_embedding = await self._generate_embedding(query)
+            
+            # Get repository ID
+            embeddings_metadata_path = os.path.join(self.output_dir, 'embeddings_cache_metadata.json')
+            repository_id = None
+            
+            if os.path.exists(embeddings_metadata_path):
+                with open(embeddings_metadata_path, 'r', encoding='utf-8') as f:
+                    cache_metadata = json.load(f)
+                    repository_id = cache_metadata.get('repository_id')
+            
+            if not repository_id:
+                # Try to find repository by name
+                repo_name = self.repo_data.get('name', '')
+                if repo_name:
+                    response = self.supabase.table('repositories').select('id').eq('name', repo_name).execute()
+                    if response.data:
+                        repository_id = response.data[0].get('id')
+            
+            if not repository_id:
+                logger.warning("Repository ID not found for similarity search")
+                return []
+            
+            # Use RPC call to fetch similar files
+            response = self.supabase.rpc(
+                'match_file_embeddings',
+                {
+                    'query_embedding': query_embedding,
+                    'match_threshold': 0.5,
+                    'match_count': top_k,
+                    'repo_id': repository_id
+                }
+            ).execute()
+            
+            # Process results
+            results = []
+            for item in response.data:
+                results.append({
+                    'file_path': item.get('file_path', ''),
+                    'similarity': item.get('similarity', 0),
+                    'content': item.get('content', ''),
+                    'metadata': item.get('metadata', {})
+                })
+            
+            return results
+            
         except Exception as e:
-            logger.warning(f"Failed to save embeddings cache: {e}")
-        
-        return embeddings
+            logger.error(f"Failed to search similar files in Supabase: {e}")
+            return []
     
-    def analyze_file_similarities(self, embeddings: Dict[str, List[float]]) -> Dict[str, List[Dict[str, Any]]]:
+    def _search_similar_local(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
-        Analyze file similarities based on embeddings.
+        Search for similar files using local embeddings.
         
         Args:
-            embeddings: Dictionary mapping file paths to embedding vectors
+            query: Query text
+            top_k: Number of results to return
             
         Returns:
-            Dictionary mapping file paths to lists of similar files
+            List of similar files with scores and metadata
         """
-        if not embeddings:
-            return {}
+        # Load embeddings
+        embeddings_path = os.path.join(self.output_dir, 'embeddings_cache.json')
         
-        # Convert embeddings to numpy arrays for faster computation
-        file_paths = list(embeddings.keys())
-        embedding_matrix = np.array([embeddings[path] for path in file_paths])
+        if not os.path.exists(embeddings_path):
+            logger.warning(f"Embeddings cache not found at {embeddings_path}")
+            return []
         
-        # Compute similarity matrix
-        similarity_matrix = cosine_similarity(embedding_matrix)
-        
-        # Build similarity dictionary
-        similarities = {}
-        for i, path in enumerate(file_paths):
-            # Get similarity scores for this file
-            scores = similarity_matrix[i]
+        try:
+            with open(embeddings_path, 'r', encoding='utf-8') as f:
+                embeddings_data = json.load(f)
             
-            # Create list of (file_path, similarity_score) pairs, sorted by score
-            similar_files = [
-                {"path": file_paths[j], "similarity": float(scores[j])}
-                for j in range(len(file_paths))
-                if i != j  # Exclude self
-            ]
+            # Generate embedding for the query
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            query_embedding = loop.run_until_complete(self._generate_embedding(query))
+            loop.close()
             
-            # Sort by similarity (descending)
-            similar_files.sort(key=lambda x: x["similarity"], reverse=True)
+            # Calculate similarity with each file
+            similarities = []
             
-            # Keep top 10 similar files
-            similarities[path] = similar_files[:10]
-        
-        return similarities
+            for file_path, file_data in embeddings_data.get('files', {}).items():
+                for i, chunk_data in enumerate(file_data.get('chunks', [])):
+                    chunk_embedding = chunk_data.get('embedding')
+                    chunk_content = chunk_data.get('content')
+                    
+                    if not chunk_embedding or not chunk_content:
+                        continue
+                    
+                    # Calculate cosine similarity
+                    similarity = self._cosine_similarity(query_embedding, chunk_embedding)
+                    
+                    similarities.append({
+                        'file_path': file_path,
+                        'chunk_index': i,
+                        'similarity': similarity,
+                        'content': chunk_content,
+                        'metadata': file_data.get('metadata', {})
+                    })
+            
+            # Sort by similarity (highest first)
+            similarities.sort(key=lambda x: x['similarity'], reverse=True)
+            
+            # Return top-k results
+            return similarities[:top_k]
+            
+        except Exception as e:
+            logger.error(f"Failed to search similar files locally: {e}")
+            return []
     
-    def analyze_code_structure(self, repo_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _cosine_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
         """
-        Perform basic code structure analysis.
+        Calculate cosine similarity between two embeddings.
         
         Args:
-            repo_data: Repository data dictionary
+            embedding1: First embedding
+            embedding2: Second embedding
             
         Returns:
-            Dictionary containing code structure information
+            Cosine similarity (0-1)
         """
-        # Initialize counters and collections
-        imports = defaultdict(set)
-        function_count = defaultdict(int)
-        class_count = defaultdict(int)
-        direct_dependencies = defaultdict(set)
+        # Convert to numpy arrays
+        a = np.array(embedding1)
+        b = np.array(embedding2)
         
-        # Regular expressions would be more robust, but keeping it simple
-        import_prefixes = [
-            "import ", "from ", "require(", "using ", "#include ",
-            "use ", "extern crate ", "const "
-        ]
-        
-        function_prefixes = [
-            "def ", "function ", "fn ", "func ", "void ", "int ", "string ",
-            "public ", "private ", "protected ", "static ", "async "
-        ]
-        
-        class_prefixes = [
-            "class ", "interface ", "struct ", "enum ", "trait ", "type "
-        ]
-        
-        # Process each file
-        for file_entry in repo_data['files']:
-            path = file_entry['metadata']['path']
-            content = file_entry['content']
-            ext = file_entry['metadata'].get('extension', '')
-            
-            # Process content line by line
-            for line in content.splitlines():
-                line = line.strip()
-                
-                # Skip empty lines and comments
-                if not line or line.startswith(("#", "//", "/*", "*", "'")):
-                    continue
-                
-                # Check for imports
-                for prefix in import_prefixes:
-                    if line.startswith(prefix):
-                        imports[path].add(line)
-                        
-                        # Extract potential direct dependency
-                        words = line.split()
-                        if len(words) > 1:
-                            potential_dep = words[1].strip('";,')
-                            direct_dependencies[path].add(potential_dep)
-                
-                # Check for function definitions
-                for prefix in function_prefixes:
-                    if prefix in line and "(" in line and ")" in line:
-                        function_count[path] += 1
-                        break
-                
-                # Check for class definitions
-                for prefix in class_prefixes:
-                    if line.startswith(prefix) or f" {prefix}" in line:
-                        class_count[path] += 1
-                        break
-        
-        # Convert sets to lists for JSON serialization
-        imports_dict = {k: list(v) for k, v in imports.items()}
-        dependencies_dict = {k: list(v) for k, v in direct_dependencies.items()}
-        
-        # Create analysis dictionary
-        analysis = {
-            "imports": imports_dict,
-            "function_count": function_count,
-            "class_count": class_count,
-            "direct_dependencies": dependencies_dict
-        }
-        
-        return analysis
+        # Calculate cosine similarity
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
     
-    def analyze_repository(self) -> Dict[str, Any]:
+    def analyze_repository(self, force_refresh: bool = False) -> Dict[str, Any]:
         """
-        Analyze the repository and generate all necessary information.
+        Analyze the repository and generate embeddings.
         
+        Args:
+            force_refresh: Whether to force regeneration of all data
+            
         Returns:
             Dictionary containing analysis results
         """
-        logger.info(f"Analyzing repository in {self.repository_dir}")
-        
-        # Load repository data
-        repo_data = self._load_repository_data()
-        
         # Generate embeddings
-        try:
-            embeddings = self.generate_embeddings(repo_data)
-            if not embeddings and self.openai_available:
-                logger.warning("Failed to generate embeddings despite having API key.")
-                logger.warning("Check your API key and connectivity.")
-        except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
-            logger.warning("Proceeding with empty embeddings.")
-            embeddings = {}
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        embeddings_data = loop.run_until_complete(self.generate_embeddings(force_refresh))
+        loop.close()
         
-        # Analyze code structure
-        try:
-            structure_analysis = self.analyze_code_structure(repo_data)
-        except Exception as e:
-            logger.error(f"Error analyzing code structure: {e}")
-            structure_analysis = {}
+        # Perform additional analysis if needed
+        # TODO: Add file similarity analysis, clustering, etc.
         
-        # Analyze file similarities based on embeddings
-        try:
-            if embeddings:
-                similarities = self.analyze_file_similarities(embeddings)
-                logger.info(f"Generated similarity analysis for {len(similarities)} files")
-            else:
-                logger.warning("Skipping similarity analysis (no embeddings available)")
-                similarities = {}
-        except Exception as e:
-            logger.error(f"Error analyzing file similarities: {e}")
-            similarities = {}
+        # Save analysis results
+        analysis_path = os.path.join(self.output_dir, 'repository_analysis.json')
         
-        # Create main analysis object
-        analysis = {
-            "file_similarities": similarities,
-            "code_structure": structure_analysis,
+        analysis_results = {
+            'repository_name': self.repo_data.get('name', 'unknown'),
+            'embedding_model': self.embedding_model,
+            'file_count': len(embeddings_data.get('files', {})),
+            'generated_at': datetime.now(timezone.utc).isoformat()
         }
         
-        # Save analysis to disk
-        self._save_analysis(analysis)
+        with open(analysis_path, 'w', encoding='utf-8') as f:
+            json.dump(analysis_results, f)
         
-        return analysis
+        logger.info(f"Repository analysis saved to {analysis_path}")
+        
+        return analysis_results
+
+
+# Standalone function for simpler use cases
+def analyze_repository(repo_data_path: str, output_dir: Optional[str] = None, force_refresh: bool = False) -> Dict[str, Any]:
+    """
+    Analyze a repository and generate embeddings.
     
-    def find_relevant_files(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Find files most relevant to a query using embeddings.
+    Args:
+        repo_data_path: Path to the repository data JSON file
+        output_dir: Directory to store analysis data
+        force_refresh: Whether to force regeneration of all data
         
-        Args:
-            query: Query string
-            top_k: Number of top results to return
-            
-        Returns:
-            List of dictionaries containing file paths and similarity scores
-        """
-        if not self.openai_available:
-            logger.warning("OpenAI API key not available, using fallback for file search")
-            return self._fallback_file_search(query, top_k)
-        
-        # Check if embeddings exist
-        if not os.path.exists(self.embeddings_path):
-            logger.warning("Embeddings not found, using fallback for file search")
-            return self._fallback_file_search(query, top_k)
-        
-        try:
-            # Load embeddings
-            with open(self.embeddings_path, 'r', encoding='utf-8') as f:
-                embeddings = json.load(f)
-            
-            if not embeddings:
-                return self._fallback_file_search(query, top_k)
-            
-            # Generate query embedding
-            client = openai.OpenAI()
-            response = client.embeddings.create(
-                input=query,
-                model=self.embedding_model
-            )
-            query_embedding = response.data[0].embedding
-            
-            # Convert embeddings to numpy arrays
-            file_paths = list(embeddings.keys())
-            embedding_matrix = np.array([embeddings[path] for path in file_paths])
-            query_vector = np.array(query_embedding)
-            
-            # Calculate similarities
-            similarities = cosine_similarity([query_vector], embedding_matrix)[0]
-            
-            # Create similarity results
-            results = [
-                {"path": file_paths[i], "similarity": float(similarities[i])}
-                for i in range(len(file_paths))
-            ]
-            
-            # Sort by similarity (descending)
-            results.sort(key=lambda x: x["similarity"], reverse=True)
-            
-            # Return top_k results
-            return results[:top_k]
-            
-        except Exception as e:
-            logger.error(f"Error finding relevant files: {str(e)}")
-            return self._fallback_file_search(query, top_k)
-    
-    def _fallback_file_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Fallback method for finding relevant files when embeddings are not available.
-        Uses simple keyword matching.
-        
-        Args:
-            query: Query string
-            top_k: Number of top results to return
-            
-        Returns:
-            List of dictionaries containing file paths and match scores
-        """
-        logger.info("Using fallback file search (keyword matching)")
-        
-        # Load repository data
-        repo_data = self._load_repository_data()
-        
-        # Normalize query
-        query_terms = query.lower().split()
-        
-        # Calculate match scores for each file
-        results = []
-        for file_entry in repo_data['files']:
-            path = file_entry['metadata']['path']
-            content = file_entry['content'].lower()
-            
-            # Simple scoring: count occurrences of query terms in content
-            score = sum(content.count(term) for term in query_terms)
-            
-            # Boost score for terms in file path
-            path_lower = path.lower()
-            path_score = sum(5 if term in path_lower else 0 for term in query_terms)
-            
-            total_score = score + path_score
-            if total_score > 0:
-                results.append({"path": path, "similarity": total_score})
-        
-        # Sort by score (descending)
-        results.sort(key=lambda x: x["similarity"], reverse=True)
-        
-        # Normalize scores to 0-1 range
-        if results:
-            max_score = max(r["similarity"] for r in results)
-            for r in results:
-                r["similarity"] = r["similarity"] / max_score
-        
-        # Return top_k results
-        return results[:top_k]
+    Returns:
+        Dictionary containing analysis results
+    """
+    analyzer = RepositoryAnalyzer(repo_data_path, output_dir)
+    return analyzer.analyze_repository(force_refresh)
 
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Analyze a repository for PromptPilot")
-    parser.add_argument("repository_dir", help="Directory containing repository data (.promptpilot folder)")
+    parser.add_argument("repo_data_path", help="Path to the repository data JSON file")
+    parser.add_argument("--output", help="Directory to store analysis data")
+    parser.add_argument("--force", action="store_true", help="Force regeneration of all data")
+    parser.add_argument("--query", help="Search query for similar files")
     
     args = parser.parse_args()
     
     try:
-        analyzer = RepositoryAnalyzer(args.repository_dir)
-        analysis = analyzer.analyze_repository()
+        analyzer = RepositoryAnalyzer(args.repo_data_path, args.output)
         
-        print("\nAnalysis complete!")
-        print(f"Results saved to: {analyzer.analysis_path}")
-        
+        if args.query:
+            # Find similar files
+            similar_files = analyzer.find_similar_files(args.query)
+            
+            print(f"\nTop similar files for query: '{args.query}'")
+            print("=" * 50)
+            
+            for i, result in enumerate(similar_files):
+                print(f"{i+1}. {result['file_path']} (similarity: {result['similarity']:.4f})")
+                print(f"   {result['metadata'].get('lines', 0)} lines, {result['metadata'].get('size_bytes', 0)/1024:.1f}KB")
+                print(f"   Preview: {result['content'][:100]}...")
+                print()
+                
+        else:
+            # Run full analysis
+            results = analyzer.analyze_repository(args.force)
+            print(f"\nRepository analysis complete: {results['file_count']} files processed")
+            
     except Exception as e:
         logger.error(f"Error analyzing repository: {str(e)}")
         raise

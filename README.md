@@ -1,145 +1,305 @@
-# PromptPilot
+# PromptPilot with Supabase Integration
 
-A powerful tool for generating optimized prompts based on code repository analysis.
-
-## Overview
-
-PromptPilot analyzes code repositories to generate context-aware prompts for AI models. It extracts code structure, semantic relationships, and important context from your codebase, then creates optimized prompts that provide AI models with the most relevant information for the task at hand.
+PromptPilot is a tool for analyzing code repositories and generating intelligent prompts for AI-assisted development. This version includes Supabase integration for efficient vector search capabilities.
 
 ## Features
 
-- **Repository Ingestion**: Process Git repositories, extracting file contents and metadata.
-- **Content Analysis**: Generate embeddings and analyze code semantics using OpenAI's text-embedding model.
-- **AST Analysis**: Parse and analyze code structure using Tree-sitter for multiple languages.
-- **Graph Database Storage**: Store repository data, code relationships, and analysis results in ArangoDB.
-- **Enhanced Prompt Generation**: Create optimized prompts using the Gemini API, incorporating repository context.
-- **Command-line Interface**: Easy-to-use CLI for processing repositories and generating prompts.
+- Repository ingestion and code extraction
+- Code embedding generation and storage using Supabase pgvector
+- Semantic code search using vector similarity
+- AI-enhanced code understanding and prompt generation
 
-## Supported Languages
-
-- Python
-- JavaScript/TypeScript
-- Java
-- C/C++
-- And more (see `core/ast_analyzer.py` for the full list)
-
-## Installation
+## Setup
 
 ### Prerequisites
 
-- Python 3.8 or higher
-- Git
-- ArangoDB (optional, for database storage)
+- Python 3.9+ installed
+- A Supabase account (free tier available at [supabase.com](https://supabase.com))
+- Git repository to analyze
 
-### Setup
+### Environment Setup
 
-1. Clone the repository:
+1. Clone this repository
+2. Create a virtual environment
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # Linux/macOS
+   # or
+   venv\Scripts\activate     # Windows
    ```
-   git clone https://github.com/yourusername/promptpilot.git
-   cd promptpilot
-   ```
-
-2. Install dependencies:
-   ```
+3. Install dependencies
+   ```bash
    pip install -r requirements.txt
    ```
 
-3. Configure environment variables:
+### Supabase Configuration
+
+1. Create a new Supabase project
+2. Enable the pgvector extension via SQL Editor:
+   ```sql
+   -- Enable the pgvector extension
+   create extension if not exists vector;
    ```
-   cp .env.example .env
+3. Create the necessary tables:
+   ```sql
+   -- Create repositories table
+   create table repositories (
+     id uuid primary key,
+     name text not null,
+     path text not null,
+     file_count integer not null default 0,
+     total_size_bytes bigint not null default 0,
+     file_types jsonb,
+     processed_date timestamp with time zone default now(),
+     created_at timestamp with time zone default now()
+   );
+
+   -- Create files table
+   create table files (
+     id uuid primary key,
+     repository_id uuid references repositories(id) on delete cascade,
+     file_path text not null,
+     size_bytes bigint not null default 0,
+     extension text,
+     last_modified timestamp with time zone,
+     lines integer not null default 0,
+     characters integer not null default 0,
+     content text,
+     content_url text,
+     created_at timestamp with time zone default now()
+   );
+
+   -- Create file_embeddings table
+   create table file_embeddings (
+     id uuid primary key,
+     file_id uuid references files(id) on delete cascade,
+     content text,
+     embedding vector(1536),
+     metadata jsonb,
+     created_at timestamp with time zone default now()
+   );
    ```
-   Edit the `.env` file and add your API keys and database credentials.
 
-### ArangoDB Setup
+4. Create a Storage bucket named "file_contents" with public read access
 
-For database functionality, you need ArangoDB installed. The easiest way is using Docker:
+5. Create the following RPC functions for similarity search:
+   ```sql
+   -- Function to search file embeddings by vector similarity
+   create or replace function match_file_embeddings(
+     query_embedding vector(1536),
+     match_threshold float,
+     match_count int,
+     repo_id uuid default null
+   )
+   returns table (
+     id uuid,
+     file_id uuid,
+     file_path text,
+     content text,
+     similarity float,
+     metadata jsonb
+   )
+   language plpgsql
+   as $$
+   begin
+     return query
+     select
+       e.id,
+       e.file_id,
+       f.file_path,
+       e.content,
+       1 - (e.embedding <=> query_embedding) as similarity,
+       e.metadata
+     from
+       file_embeddings e
+     join
+       files f on e.file_id = f.id
+     where
+       (repo_id is null or f.repository_id = repo_id) and
+       (1 - (e.embedding <=> query_embedding)) > match_threshold
+     order by
+       e.embedding <=> query_embedding
+     limit match_count;
+   end;
+   $$;
 
-```
-docker run -p 8529:8529 -e ARANGO_ROOT_PASSWORD=your_password arangodb/arangodb:latest
-```
+   -- Function to search file embeddings by text
+   create or replace function search_files_by_text(
+     query_text text,
+     match_threshold float,
+     match_count int,
+     repo_id uuid default null
+   )
+   returns table (
+     id uuid,
+     file_path text,
+     content text,
+     similarity float,
+     metadata jsonb
+   )
+   language plpgsql
+   as $$
+   declare
+     query_embedding vector(1536);
+   begin
+     -- Call embedding generation (replace with your implementation)
+     -- This is a placeholder - you need to implement embedding generation
+     -- For example, through an Edge Function
+     query_embedding := public.generate_embedding(query_text);
+     
+     return query
+     select
+       f.id,
+       f.file_path,
+       e.content,
+       1 - (e.embedding <=> query_embedding) as similarity,
+       e.metadata
+     from
+       file_embeddings e
+     join
+       files f on e.file_id = f.id
+     where
+       (repo_id is null or f.repository_id = repo_id) and
+       (1 - (e.embedding <=> query_embedding)) > match_threshold
+     order by
+       e.embedding <=> query_embedding
+     limit match_count;
+   end;
+   $$;
+   ```
+
+6. Create a Supabase Edge Function for embedding generation:
+   - Go to Edge Functions in your Supabase dashboard
+   - Create a new function named "generate-embeddings"
+   - Implement the function to generate embeddings (example using gte-small):
+   ```typescript
+   import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+   import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+   const embeddingModel = 'gte-small'; // Supabase's default is gte-small
+   
+   serve(async (req) => {
+     // Create a Supabase client with the service role key
+     const supabaseClient = createClient(
+       Deno.env.get('SUPABASE_URL') ?? '',
+       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
+       { global: { headers: { Authorization: req.headers.get('Authorization')! } } }
+     )
+
+     // Parse the request body
+     const { text } = await req.json()
+     
+     if (!text) {
+       return new Response(
+         JSON.stringify({ error: 'Missing text parameter' }),
+         { status: 400, headers: { 'Content-Type': 'application/json' } }
+       )
+     }
+
+     try {
+       // Generate embedding using pgvector's built-in functionality
+       // This is a placeholder - implement according to your chosen approach
+       // Could use Supabase's built-in embedding generation or call an external API
+       
+       // Example using custom SQL function (you'd need to create this)
+       const { data, error } = await supabaseClient.rpc('generate_embedding', {
+         input_text: text
+       })
+       
+       if (error) throw error
+       
+       return new Response(
+         JSON.stringify({ embedding: data }),
+         { status: 200, headers: { 'Content-Type': 'application/json' } }
+       )
+     } catch (error) {
+       return new Response(
+         JSON.stringify({ error: error.message }),
+         { status: 500, headers: { 'Content-Type': 'application/json' } }
+       )
+     }
+   })
+   ```
+
+7. Create a `.env` file in the project root with your Supabase credentials:
+   ```
+   SUPABASE_URL=your_supabase_url
+   SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
+   OPENAI_API_KEY=your_openai_api_key  # Optional, for fallback embedding generation
+   ```
 
 ## Usage
 
-### Process a Repository
+### Ingesting a Repository
 
-```
-python promptpilot.py process /path/to/repository
-```
+```python
+from core.ingest import RepositoryIngestor
 
-### Generate a Prompt
+# Initialize the repository ingestor
+ingestor = RepositoryIngestor('/path/to/your/repo')
 
-```
-python promptpilot.py prompt "Explain how the authentication system works"
-```
-
-### List Processed Repositories
-
-```
-python promptpilot.py list
+# Process the repository
+repo_data = ingestor.process_repository()
 ```
 
-### Test Database Connection
+### Generating Embeddings
 
-```
-python test_db.py
-```
+```python
+from core.analyze import RepositoryAnalyzer
 
-### Process and Store Repository Data
+# Initialize the repository analyzer with Supabase integration
+analyzer = RepositoryAnalyzer('/path/to/repository_data.json', use_supabase=True)
 
-```
-python -m utils.db_utils /path/to/repository --full
-```
-
-## Architecture
-
-PromptPilot consists of several core modules:
-
-- **ingest.py**: Repository ingestion and file processing
-- **analyze.py**: Content analysis and embedding generation
-- **ast_analyzer.py**: AST analysis using Tree-sitter
-- **enhanced_db.py**: ArangoDB integration for storing repository data
-- **enhanced_prompt_generator.py**: Context-aware prompt generation
-- **promptpilot.py**: Main CLI interface
-
-## Development
-
-### Project Structure
-
-```
-/promptpilot
-├── core/                        # Core modules
-│   ├── __init__.py
-│   ├── ingest.py                # Repository ingestion module
-│   ├── analyze.py               # Content analysis and embedding module 
-│   ├── ast_analyzer.py          # AST analysis module
-│   ├── enhanced_db.py           # Database integration module
-│   └── enhanced_prompt_generator.py  # Prompt generation module
-├── utils/                       # Utility functions
-│   └── db_utils.py              # Database utilities
-├── .env.example                 # Example environment variables template
-├── .gitignore                   # Git ignore file
-├── captainslog.md               # Project log
-├── promptpilot.py               # Main CLI interface
-├── test_db.py                   # Database test script
-└── requirements.txt             # Project dependencies
+# Generate embeddings
+embeddings_data = analyzer.generate_embeddings()
 ```
 
-### Running Tests
+### Searching for Similar Code
 
+```python
+from core.enhanced_db import get_db
+
+# Get the database instance
+db = get_db()
+
+# Search for similar code by text query
+results = db.search_similar_text("implement authentication function", top_k=5)
+
+# Print results
+for result in results:
+    print(f"File: {result['file_path']}")
+    print(f"Similarity: {result['similarity']:.4f}")
+    print(f"Content: {result['content'][:200]}...")
+    print("-" * 50)
 ```
-python test_db.py
+
+## Advanced Configuration
+
+### Chunking Strategy
+
+You can adjust the chunking strategy for large files in the `_chunk_content` method of the `EnhancedDatabase` class:
+
+```python
+# Process repository with custom chunk size
+db.process_repository_chunks(repo_data, chunk_size=3000)
 ```
 
-## Limitations
+### Similarity Threshold
 
-- Large files (>500KB) are skipped during ingestion to maintain reasonable processing times.
-- API rate limits may affect prompt generation and embedding creation.
-- Tree-sitter parser availability depends on your system configuration.
+Adjust the similarity threshold in search functions to control the strictness of matches:
+
+```python
+# More strict matching
+results = db.search_similar_text("query", similarity_threshold=0.8)
+
+# More lenient matching
+results = db.search_similar_text("query", similarity_threshold=0.5)
+```
 
 ## License
 
-MIT License - See LICENSE file for details.
+[MIT License](LICENSE)
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit pull requests or open issues to improve the project.
+Contributions are welcome! Please feel free to submit a Pull Request.

@@ -22,20 +22,18 @@ def test_openai_api():
     # Get API key
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        logger.error("No OpenAI API key found in environment variables.")
-        logger.error("Please set the OPENAI_API_KEY environment variable in your .env file.")
+        logger.error("No OpenAI API key found in environment variables or .env file.")
+        logger.error("Please set the OPENAI_API_KEY environment variable or add it to your .env file.")
         return False
     
     # Mask API key for display
     masked_key = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else "********"
     logger.info(f"Using OpenAI API key (masked): {masked_key}")
     
-    # Check key format
+    # Note key format (just informational)
     is_project_key = api_key.startswith("sk-proj-")
     if is_project_key:
-        logger.warning("You're using a project-scoped API key (starts with 'sk-proj-').")
-        logger.warning("This type of key may cause issues with the standard OpenAI client.")
-        logger.warning("Consider using a standard API key instead (starts with 'sk-' but not 'sk-proj-').")
+        logger.info("Using a project-scoped API key.")
     else:
         logger.info("Using standard API key format.")
     
@@ -117,7 +115,7 @@ def test_openai_api():
         logger.info("1. Verify your API key is correct and active in your OpenAI account")
         logger.info("2. Check if your account has access to the models you're trying to use")
         logger.info("3. Ensure you have sufficient credits in your OpenAI account")
-        logger.info("4. If using a project-scoped key (sk-proj-*), try a standard key instead")
+        logger.info("4. Make sure your API key doesn't contain any extra spaces or special characters")
         logger.info("5. Check OpenAI's status page for any ongoing service issues: https://status.openai.com/")
         
         return False

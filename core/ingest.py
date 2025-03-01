@@ -10,11 +10,18 @@ from pathlib import Path
 from typing import Dict, List, Any, Set, Optional, Tuple
 import logging
 from collections import Counter, defaultdict
+import uuid
+import time
 
 # git package is provided by the gitpython library
 # If you're seeing an import error, run: pip install gitpython
 import git
 from tqdm import tqdm
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -48,49 +55,64 @@ class RepositoryIngestor:
         
         Args:
             repo_path: Path to the Git repository
-            output_dir: Directory to store processed data (defaults to .promptpilot in repo_path)
+            output_dir: Directory to store processed data
         """
         self.repo_path = os.path.abspath(repo_path)
+        
+        # Determine repository name from path
         self.repo_name = os.path.basename(self.repo_path)
         
-        if not os.path.exists(self.repo_path):
-            raise ValueError(f"Repository path '{self.repo_path}' does not exist")
-        
-        if not os.path.isdir(os.path.join(self.repo_path, '.git')):
-            raise ValueError(f"Path '{self.repo_path}' is not a Git repository")
-        
-        # Set up output directory
-        if output_dir:
-            self.output_dir = os.path.abspath(output_dir)
+        # Determine output directory
+        if output_dir is None:
+            cwd = os.getcwd()
+            default_dir = os.path.join(cwd, '.promptpilot')
+            self.output_dir = os.path.join(default_dir, self.repo_name)
         else:
-            self.output_dir = os.path.join(self.repo_path, '.promptpilot')
-            
+            self.output_dir = os.path.abspath(output_dir)
+        
+        # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
-        logger.info(f"Repository ingestor initialized for {self.repo_name}")
-        logger.info(f"Output directory: {self.output_dir}")
         
-        # Initialize Git repository
-        self.repo = git.Repo(self.repo_path)
+        # Initialize Supabase client
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
         
+        if supabase_url and supabase_key:
+            try:
+                self.supabase = create_client(supabase_url, supabase_key)
+                logger.info("Supabase client initialized for file storage")
+            except Exception as e:
+                logger.error(f"Failed to initialize Supabase client: {e}")
+                self.supabase = None
+        else:
+            logger.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set, using local storage only")
+            self.supabase = None
+    
     def should_process_file(self, file_path: str) -> bool:
         """
-        Determine if a file should be processed based on extension and ignore rules.
-        Updated to handle large files with chunking.
+        Check if a file should be processed based on extension and ignore rules.
         
         Args:
             file_path: Path to the file
-                
+            
         Returns:
             True if the file should be processed, False otherwise
         """
-        # Skip ignored files/directories
-        for ignore in IGNORE_FILES:
-            if ignore in file_path.split(os.sep):
-                return False
-        
-        # Check if it's a directory
-        if os.path.isdir(os.path.join(self.repo_path, file_path)):
+        # Check if file exists
+        if not os.path.isfile(file_path):
             return False
+        
+        # Check if file is too large
+        file_size = os.path.getsize(file_path)
+        if file_size > MAX_FILE_SIZE:
+            logger.debug(f"Skipping large file: {file_path} ({file_size/1024:.1f}KB)")
+            return False
+        
+        # Check if file or its directory should be ignored
+        path_parts = Path(file_path).parts
+        for part in path_parts:
+            if part in IGNORE_FILES:
+                return False
         
         # Check file extension
         _, ext = os.path.splitext(file_path)
@@ -101,117 +123,80 @@ class RepositoryIngestor:
         List all files in the repository that should be processed.
         
         Returns:
-            List of relative file paths
+            List of file paths
         """
-        all_files = []
+        files = []
         
-        for root, dirs, files in os.walk(self.repo_path):
-            # Skip .git directory
-            if '.git' in dirs:
-                dirs.remove('.git')
+        for root, dirs, filenames in os.walk(self.repo_path):
+            # Skip ignored directories
+            dirs[:] = [d for d in dirs if d not in IGNORE_FILES]
+            
+            for filename in filenames:
+                file_path = os.path.join(root, filename)
                 
-            # Process each file
-            for file in files:
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, self.repo_path)
-                
-                if self.should_process_file(rel_path):
-                    all_files.append(rel_path)
+                if self.should_process_file(file_path):
+                    files.append(file_path)
         
-        return all_files
+        return files
     
     def _chunk_large_file(self, file_path: str, max_chunk_size: int = 100 * 1024) -> Optional[str]:
         """
-        Process a large file by reading it in chunks.
+        Handle large files by chunking them.
         
         Args:
             file_path: Path to the file
             max_chunk_size: Maximum chunk size in bytes
             
         Returns:
-            File content as a string, or None if the file couldn't be read
+            File content as a string or None if file is too large
         """
-        full_path = os.path.join(self.repo_path, file_path)
+        # Get total file size
+        file_size = os.path.getsize(file_path)
         
-        try:
-            file_size = os.path.getsize(full_path)
-            
-            # For text files, read in chunks
-            chunks = []
-            total_bytes_read = 0
-            max_chunks = 10  # Limit the number of chunks to prevent excessive memory usage
-            
-            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
-                while total_bytes_read < file_size and len(chunks) < max_chunks:
-                    chunk = f.read(max_chunk_size)
-                    if not chunk:
-                        break
-                        
-                    chunks.append(chunk)
-                    total_bytes_read += len(chunk.encode('utf-8'))
-                    
-                    # If we've read enough, break
-                    if total_bytes_read >= 1000000:  # 1MB limit
-                        chunks.append("\n... [file truncated due to size] ...")
-                        break
-            
-            # Combine chunks
-            content = ''.join(chunks)
-            logger.info(f"Processed large file {file_path} ({total_bytes_read / 1024:.1f}KB of {file_size / 1024:.1f}KB)")
-            
-            return content
-            
-        except UnicodeDecodeError:
+        # If file is still way too large, just read the first part
+        if file_size > 2 * max_chunk_size:
             try:
-                # Fallback to latin-1 encoding
-                chunks = []
-                with open(full_path, 'r', encoding='latin-1', errors='replace') as f:
-                    while len(chunks) < max_chunks:
-                        chunk = f.read(max_chunk_size)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                return ''.join(chunks)
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read(max_chunk_size)
+                    return content + f"\n\n... (truncated, {file_size/1024:.1f}KB total)"
             except Exception as e:
-                logger.warning(f"Failed to read large file {file_path}: {str(e)}")
+                logger.warning(f"Error reading large file {file_path}: {str(e)}")
                 return None
+        
+        # Otherwise, try to read the whole file
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                return f.read()
         except Exception as e:
-            logger.warning(f"Failed to read large file {file_path}: {str(e)}")
+            logger.warning(f"Error reading file {file_path}: {str(e)}")
             return None
     
     def extract_file_content(self, file_path: str) -> Optional[str]:
         """
-        Extract the content of a file.
+        Extract content from a file.
         
         Args:
-            file_path: Relative path to the file within the repository
+            file_path: Path to the file
             
         Returns:
-            File content as a string, or None if the file couldn't be read
+            File content as a string or None if extraction failed
         """
-        full_path = os.path.join(self.repo_path, file_path)
-        
-        # Check if it's a large file
         try:
-            if os.path.getsize(full_path) > MAX_FILE_SIZE:
+            # Handle large files
+            if os.path.getsize(file_path) > MAX_FILE_SIZE:
                 return self._chunk_large_file(file_path)
-        except (FileNotFoundError, OSError):
-            return None
-        
-        # Handle normal-sized files as before
-        try:
-            with open(full_path, 'r', encoding='utf-8') as f:
-                return f.read()
+            
+            # Read file content
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            
+            return content
+            
         except UnicodeDecodeError:
-            try:
-                # Try with Latin-1 encoding as fallback
-                with open(full_path, 'r', encoding='latin-1') as f:
-                    return f.read()
-            except Exception as e:
-                logger.warning(f"Failed to read file {file_path}: {str(e)}")
-                return None
+            logger.warning(f"UnicodeDecodeError for {file_path}, skipping")
+            return None
         except Exception as e:
-            logger.warning(f"Failed to read file {file_path}: {str(e)}")
+            logger.warning(f"Failed to extract content from {file_path}: {str(e)}")
             return None
     
     def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
@@ -219,39 +204,71 @@ class RepositoryIngestor:
         Get metadata for a file.
         
         Args:
-            file_path: Relative path to the file within the repository
+            file_path: Path to the file
             
         Returns:
-            Dictionary of metadata
+            Dictionary containing file metadata
         """
-        full_path = os.path.join(self.repo_path, file_path)
-        
         try:
+            # Get relative path from repository root
+            rel_path = os.path.relpath(file_path, self.repo_path)
+            
             # Get file stats
-            stats = os.stat(full_path)
+            stats = os.stat(file_path)
             
             # Get file extension
             _, ext = os.path.splitext(file_path)
             
-            # Get Git history
-            file_history = list(self.repo.iter_commits(paths=file_path, max_count=5))
-            
             return {
-                'path': file_path,
+                'path': rel_path,
                 'size_bytes': stats.st_size,
-                'last_modified': stats.st_mtime,
-                'extension': ext.lstrip('.').lower() if ext else '',
-                'num_commits': len(file_history),
-                'last_commit_hash': str(file_history[0]) if file_history else None,
-                'last_commit_date': file_history[0].committed_datetime.isoformat() if file_history else None,
-                'last_commit_author': file_history[0].author.name if file_history else None,
+                'extension': ext.lower(),
+                'last_modified': stats.st_mtime
             }
+            
         except Exception as e:
             logger.warning(f"Failed to get metadata for {file_path}: {str(e)}")
             return {
                 'path': file_path,
                 'error': str(e)
             }
+    
+    def upload_to_supabase(self, file_content: str, file_path: str) -> Optional[str]:
+        """
+        Upload file content to Supabase Storage.
+        
+        Args:
+            file_content: Content of the file as string
+            file_path: Path of the file (used for naming)
+            
+        Returns:
+            Public URL of the uploaded content or None if upload failed
+        """
+        if not self.supabase:
+            return None
+            
+        try:
+            # Generate a unique filename based on path and timestamp
+            safe_path = file_path.replace('/', '_').replace('\\', '_')
+            timestamp = int(time.time())
+            unique_filename = f"{safe_path}_{timestamp}.txt"
+            
+            # Upload file content to Supabase Storage
+            result = self.supabase.storage.from_("file_contents").upload(
+                unique_filename, 
+                file_content.encode('utf-8'),
+                {"content-type": "text/plain"}
+            )
+            
+            # Get the public URL
+            public_url = self.supabase.storage.from_("file_contents").get_public_url(unique_filename)
+            
+            logger.debug(f"Uploaded {file_path} to Supabase Storage")
+            return public_url
+            
+        except Exception as e:
+            logger.error(f"Failed to upload {file_path} to Supabase: {e}")
+            return None
     
     def process_repository(self) -> Dict[str, Any]:
         """
@@ -281,6 +298,11 @@ class RepositoryIngestor:
             # Get metadata
             metadata = self.get_file_metadata(file_path)
             
+            # Upload content to Supabase if available
+            content_url = None
+            if self.supabase:
+                content_url = self.upload_to_supabase(content, metadata['path'])
+            
             # Update statistics
             ext = metadata.get('extension', '')
             file_types[ext] += 1
@@ -289,7 +311,8 @@ class RepositoryIngestor:
             # Create file entry
             file_entry = {
                 'metadata': metadata,
-                'content': content,
+                'content': content[:10000],  # Truncate content for database storage
+                'content_url': content_url,  # Add content URL for access to full content
                 'lines': len(content.splitlines()),
                 'characters': len(content)
             }
@@ -331,7 +354,8 @@ class RepositoryIngestor:
                 {
                     'metadata': file_entry['metadata'],
                     'lines': file_entry['lines'],
-                    'characters': file_entry['characters']
+                    'characters': file_entry['characters'],
+                    'content_url': file_entry.get('content_url')
                 }
                 for file_entry in repo_data['files']
             ]
@@ -388,6 +412,10 @@ class RepositoryIngestor:
             lines = file_entry['lines']
             digest.append(f"\n### {path}")
             digest.append(f"Lines: {lines}")
+            
+            # Add URL if available
+            if file_entry.get('content_url'):
+                digest.append(f"Content URL: {file_entry['content_url']}")
             
             # Add first few lines of content as preview
             content = file_entry['content']

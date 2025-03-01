@@ -9,6 +9,8 @@ import json
 from openai import OpenAI
 import logging
 import re
+from pathlib import Path
+from dotenv import load_dotenv
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -16,48 +18,27 @@ logger = logging.getLogger(__name__)
 
 def test_openai_api():
     """Test the OpenAI API key with both embeddings and a simple completion."""
+    # Load environment variables from .env file
+    load_dotenv()
+    
     # Use the OpenAI API key from environment variables
     api_key = os.environ.get("OPENAI_API_KEY")
     
     if not api_key:
-        logger.error("No OpenAI API key found in environment variables. Please set the OPENAI_API_KEY environment variable.")
+        logger.error("No OpenAI API key found in environment variables or .env file.")
+        logger.error("Please set the OPENAI_API_KEY environment variable or add it to your .env file.")
         logger.error("You can get a key from https://platform.openai.com/api-keys")
         return False
     
-    # Check if this is a project-scoped key
+    # Check key format (just informational)
     is_project_key = api_key.startswith("sk-proj-")
     
     logger.info(f"Testing OpenAI API key (masked): {api_key[:8]}...{api_key[-4:] if len(api_key) > 12 else '****'}")
     logger.info(f"API key format: {'Project-scoped key' if is_project_key else 'Standard key'}")
     
-    # For project-scoped keys, try to extract project ID from the key
-    project_id = None
-    openai_kwargs = {}
-    
-    if is_project_key:
-        logger.warning("Project-scoped keys may not work correctly with the current setup.")
-        logger.warning("Consider using a standard API key (starting with 'sk-' but not 'sk-proj-').")
-        
-        # Try to use environment variable for project ID if available
-        project_id = os.environ.get("OPENAI_PROJECT_ID")
-        if project_id:
-            logger.info(f"Using project ID from environment: {project_id}")
-            openai_kwargs["project"] = project_id
-        else:
-            # Try to extract project ID if available in the key
-            match = re.search(r'proj-([a-zA-Z0-9]+)', api_key)
-            if match:
-                project_id = match.group(1)
-                logger.info(f"Detected project ID from key: {project_id}")
-                openai_kwargs["project"] = project_id
-                logger.warning("Extracted project ID may not be correct.")
-                logger.warning("If authentication fails, try setting OPENAI_PROJECT_ID environment variable.")
-            else:
-                logger.warning("Could not extract project ID from key. Using default.")
-    
-    # Initialize the client with appropriate parameters
+    # Initialize the client with just the API key (simplest approach)
     try:
-        client = OpenAI(api_key=api_key, **openai_kwargs)
+        client = OpenAI(api_key=api_key)
     except Exception as e:
         logger.error(f"Failed to initialize OpenAI client: {e}")
         return False
@@ -71,10 +52,6 @@ def test_openai_api():
     except Exception as e:
         logger.error(f"❌ API key validation failed: {e}")
         logger.error("Your API key appears to be invalid or has insufficient permissions")
-        if is_project_key:
-            logger.error("For project-scoped keys, make sure you have the correct project ID")
-            logger.error("You can set the OPENAI_PROJECT_ID environment variable with your project ID")
-            logger.error("Or consider using a standard API key instead (recommended)")
         return False
     
     # Test embeddings
@@ -121,8 +98,7 @@ if __name__ == "__main__":
     print("You should see your API key in the .env file and ensure it's properly configured.")
     print("\nAPI Key Guidelines:")
     print("1. Standard API keys start with 'sk-' (recommended)")
-    print("2. Project-scoped keys start with 'sk-proj-' and may require additional configuration")
-    print("\nIf using a project-scoped key, you may need to set the OPENAI_PROJECT_ID environment variable")
+    print("2. Project-scoped keys start with 'sk-proj-' but should work with minimal configuration")
     print("="*50 + "\n")
     
     test_openai_api() 
