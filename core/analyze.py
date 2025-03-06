@@ -19,6 +19,18 @@ from tqdm.asyncio import tqdm_asyncio
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import uuid
+import traceback
+
+from openai import OpenAI, AsyncOpenAI  # Updated imports for newer OpenAI SDK
+
+try:
+    from postgrest.exceptions import APIError
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+
+from .enhanced_db import RepositoryDB
+from .utils import timer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -27,12 +39,8 @@ logger = logging.getLogger('promptpilot.analyze')
 # Load environment variables
 load_dotenv()
 
-try:
-    import openai
-except ImportError:
-    openai = None
-    logger.warning("OpenAI package not installed, will use simple embedding instead")
-
+# Constants for embedding
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 
 class RepositoryAnalyzer:
     """Class to analyze a repository and generate embeddings for code files."""
@@ -40,64 +48,76 @@ class RepositoryAnalyzer:
     def __init__(self, 
                  repo_data_path: str,
                  output_dir: Optional[str] = None,
-                 embedding_model: str = "text-embedding-3-small",
+                 embedding_model: str = DEFAULT_EMBEDDING_MODEL,
                  chunk_size: int = 4000,
                  use_supabase: bool = True):
         """
         Initialize the repository analyzer.
         
         Args:
-            repo_data_path: Path to the repository data JSON file
-            output_dir: Directory to store analysis data
-            embedding_model: Name of the embedding model to use
-            chunk_size: Maximum number of tokens per chunk
-            use_supabase: Whether to use Supabase for embedding generation and storage
+            repo_data_path: Path to the repository data JSON file or directory
+            output_dir: Output directory for analysis results
+            embedding_model: OpenAI embedding model to use
+            chunk_size: Maximum chunk size for embedding generation
+            use_supabase: Whether to use Supabase for database operations
         """
-        self.repo_data_path = os.path.abspath(repo_data_path)
+        self.repo_data_path = repo_data_path
         
-        # Load repository data
-        with open(self.repo_data_path, 'r', encoding='utf-8') as f:
-            self.repo_data = json.load(f)
+        # If repo_data_path is a directory, look for repository_data.json inside it
+        if os.path.isdir(repo_data_path):
+            self.repo_data_path = os.path.join(repo_data_path, "repository_data.json")
+        
+        # Get repository directory from repo_data_path
+        self.repo_dir = os.path.dirname(self.repo_data_path)
         
         # Set output directory
-        repo_dir = os.path.dirname(self.repo_data_path)
-        self.output_dir = os.path.abspath(output_dir) if output_dir else repo_dir
-        
-        # Create output directory if it doesn't exist
+        if output_dir:
+            self.output_dir = output_dir
+        else:
+            self.output_dir = self.repo_dir
+            
+        # Ensure output directory exists
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # Set embedding model name
+        # Define paths for embeddings
+        self.file_embeddings_path = os.path.join(self.output_dir, "embeddings.json")
+        self.embeddings_cache_path = os.path.join(self.output_dir, "embeddings_cache.json")
+        self.embeddings_metadata_path = os.path.join(self.output_dir, "embeddings_metadata.json")
+        
+        # Set embedding model and chunk size
         self.embedding_model = embedding_model
         self.chunk_size = chunk_size
-        self.openai_client = None
-        self.use_supabase = use_supabase
-        self.supabase = None
         
-        # Initialize API clients
-        if openai and os.environ.get("OPENAI_API_KEY") and not self.use_supabase:
+        # Initialize OpenAI client if available
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY")
+        self.openai_client = None
+        self.async_openai_client = None
+        self.openai_available = False
+        if self.openai_api_key:
             try:
-                self.openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+                # Initialize both sync and async clients
+                self.openai_client = OpenAI(api_key=self.openai_api_key)
+                self.async_openai_client = AsyncOpenAI(api_key=self.openai_api_key)
+                self.openai_available = True
                 logger.info(f"Using OpenAI embedding model: {embedding_model}")
             except Exception as e:
-                logger.warning(f"Failed to initialize OpenAI client: {str(e)}")
-                self.openai_client = None
+                logger.error(f"Error initializing OpenAI: {str(e)}")
+                self.openai_available = False
         
-        # Initialize Supabase client if requested
-        if self.use_supabase:
-            supabase_url = os.environ.get("SUPABASE_URL")
-            supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-            
-            if supabase_url and supabase_key:
-                try:
-                    self.supabase = create_client(supabase_url, supabase_key)
-                    logger.info("Supabase client initialized for embedding generation and storage")
-                except Exception as e:
-                    logger.error(f"Failed to initialize Supabase client: {e}")
-                    self.supabase = None
-            else:
-                logger.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set, falling back to OpenAI")
+        # Initialize Supabase client if available
+        self.supabase = None
+        self.use_supabase = use_supabase
+        if use_supabase:
+            try:
+                from core.enhanced_db import get_db
+                self.db = get_db()
+                if not self.db or not self.db.is_available():
+                    logger.warning("Supabase connection not available, using local embedding storage")
+                    self.use_supabase = False
+            except Exception as e:
+                logger.error(f"Error initializing Supabase: {str(e)}")
                 self.use_supabase = False
-    
+
     def _get_file_content(self, file_entry: Dict[str, Any]) -> str:
         """
         Get the content of a file.
@@ -125,76 +145,39 @@ class RepositoryAnalyzer:
         # Use content field
         return file_entry.get('content', '')
     
-    async def _generate_embedding_openai(self, text: str) -> List[float]:
-        """
-        Generate an embedding using OpenAI's API.
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            List of floats representing the embedding
-        """
-        if not self.openai_client:
-            logger.warning("OpenAI client not available, falling back to Supabase")
-            return []
-        
-        try:
-            response = await asyncio.to_thread(
-                self.openai_client.embeddings.create,
-                input=text,
-                model=self.embedding_model
-            )
-            return response.data[0].embedding
-        except Exception as e:
-            logger.warning(f"OpenAI embedding generation failed: {str(e)}")
-            return []
-    
-    async def _generate_embedding_supabase(self, text: str) -> List[float]:
-        """
-        Generate an embedding using Supabase's pgvector.
-        
-        Args:
-            text: Input text
-            
-        Returns:
-            List of floats representing the embedding
-        """
-        if not self.supabase:
-            return await self._generate_embedding_openai(text)
-        
-        try:
-            # Use Supabase's Edge Function to generate embedding
-            response = await asyncio.to_thread(
-                self.supabase.functions.invoke,
-                "generate-embeddings",
-                {"text": text}
-            )
-            
-            if response and "embedding" in response:
-                return response["embedding"]
-            else:
-                logger.warning("Supabase embedding generation returned invalid response")
-                return await self._generate_embedding_openai(text)
-                
-        except Exception as e:
-            logger.warning(f"Supabase embedding generation failed: {str(e)}")
-            return await self._generate_embedding_openai(text)
-    
     async def _generate_embedding(self, text: str) -> List[float]:
         """
-        Generate an embedding for text.
+        Generate an embedding for text using OpenAI API.
         
         Args:
-            text: Input text
+            text: Text to embed
             
         Returns:
-            List of floats representing the embedding
+            List of floating point values representing the embedding or empty list if generation fails
         """
-        if self.use_supabase and self.supabase:
-            return await self._generate_embedding_supabase(text)
-        else:
-            return await self._generate_embedding_openai(text)
+        try:
+            if not self.openai_available or not self.async_openai_client:
+                logger.warning("OpenAI client not available for generating embeddings")
+            return []
+            
+            # Use the new OpenAI API format
+            response = await self.async_openai_client.embeddings.create(
+                model=self.embedding_model,
+                input=text,
+                encoding_format="float"
+            )
+            
+            if response and response.data and len(response.data) > 0:
+                embedding = response.data[0].embedding
+                logger.debug(f"Generated embedding with {len(embedding)} dimensions")
+                return embedding
+            else:
+                logger.error("Empty response from OpenAI embeddings API")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error generating embedding: {e}")
+            return []
     
     def _hash_content(self, content: str) -> str:
         """
@@ -247,226 +230,124 @@ class RepositoryAnalyzer:
         
         return chunks
     
-    def _store_embeddings_to_supabase(self, embeddings_data: Dict[str, Any]) -> bool:
+    def _store_embeddings_to_supabase(self, file_embeddings: Dict[str, Any]) -> bool:
         """
-        Store embeddings data to Supabase.
+        Store file embeddings to Supabase database.
         
         Args:
-            embeddings_data: Dictionary containing embedding information
+            file_embeddings: Dictionary mapping file paths to their embeddings
             
         Returns:
             True if successful, False otherwise
         """
-        if not self.supabase:
+        if not self.db or not self.use_supabase:
+            logger.warning("Database connection not available, skipping Supabase storage")
             return False
             
         try:
-            # Prepare data for insertion
-            repository_id = embeddings_data.get('repository_id', str(uuid.uuid4()))
-            repository_name = self.repo_data.get('name', 'unnamed')
-            
-            # Store repository record
-            repo_result = self.supabase.table('repositories').upsert({
-                'id': repository_id,
-                'name': repository_name,
-                'path': self.repo_data.get('path', ''),
-                'file_count': self.repo_data.get('file_count', 0),
-                'processed_date': datetime.now().isoformat()
-            }).execute()
-            
-            # Store file embeddings
-            for file_path, file_data in embeddings_data.get('files', {}).items():
-                for i, chunk_data in enumerate(file_data.get('chunks', [])):
-                    # Prepare embedding record
-                    embedding_record = {
-                        'id': str(uuid.uuid4()),
-                        'repository_id': repository_id,
-                        'file_path': file_path,
-                        'chunk_index': i,
-                        'content': chunk_data.get('content', ''),
-                        'embedding': chunk_data.get('embedding', []),
-                        'content_hash': chunk_data.get('hash', ''),
-                        'metadata': {
-                            'file_size': file_data.get('metadata', {}).get('size_bytes', 0),
-                            'extension': file_data.get('metadata', {}).get('extension', ''),
-                            'lines': file_data.get('lines', 0)
-                        }
-                    }
+            # Get repository ID from metadata
+            repo_meta_path = os.path.join(self.repo_dir, "repository_metadata.json")
+            if os.path.exists(repo_meta_path):
+                with open(repo_meta_path, "r", encoding="utf-8") as f:
+                    repo_metadata = json.load(f)
+                    repo_id = repo_metadata.get("id")
                     
-                    # Insert embedding record
-                    self.supabase.table('file_embeddings').upsert(
-                        embedding_record,
-                        on_conflict='id'
-                    ).execute()
-            
-            logger.info(f"Successfully stored embeddings for {repository_name} in Supabase")
-            return True
+                    if not repo_id:
+                        logger.warning("Repository ID not found in metadata, cannot store embeddings to Supabase")
+                        return False
+                    
+                    # Extract just the embedding vectors for storage
+                    embedding_vectors = {}
+                    for file_path, embedding_data in file_embeddings.items():
+                        embedding_vectors[file_path] = embedding_data["embedding"]
+                    
+                    # Store embeddings via database helper
+                    success = self.db.store_file_embeddings(repo_id, embedding_vectors)
+                    if success:
+                        logger.info(f"Successfully stored {len(file_embeddings)} file embeddings to Supabase")
+                    else:
+                        logger.error("Failed to store file embeddings to Supabase")
+                    
+                    return success
+            else:
+                logger.warning(f"Repository metadata not found at {repo_meta_path}")
+                return False
             
         except Exception as e:
-            logger.error(f"Failed to store embeddings in Supabase: {e}")
+            logger.error(f"Error storing embeddings to Supabase: {e}")
+            logger.error(traceback.format_exc())
             return False
     
-    async def generate_embeddings(self, force_refresh: bool = False) -> Dict[str, Any]:
+    @timer
+    def generate_file_embeddings(self) -> Dict[str, Any]:
         """
-        Generate embeddings for all files in the repository.
-        
-        Args:
-            force_refresh: Whether to force regeneration of all embeddings
+        Generate embeddings for files in the repository.
             
         Returns:
-            Dictionary containing embedding information
+            Dictionary mapping file paths to their embeddings
         """
-        logger.info(f"Generating embeddings for repository: {self.repo_data.get('name', 'unknown')}")
-        
-        # Check if embedding services are available
-        if not self.openai_client and not self.supabase:
-            logger.error("Neither OpenAI API nor Supabase are available for embedding generation")
-            raise ValueError("No embedding service available")
-        
-        # Try to load existing embeddings
-        embeddings_path = os.path.join(self.output_dir, 'embeddings_cache.json')
-        embeddings_metadata_path = os.path.join(self.output_dir, 'embeddings_cache_metadata.json')
-        
-        embeddings_data = {
-            'repository_id': str(uuid.uuid4()),
-            'model': self.embedding_model,
-            'generated_at': datetime.now(timezone.utc).isoformat(),
-            'files': {}
-        }
-        
-        # Load existing cache if available
-        if os.path.exists(embeddings_path) and os.path.exists(embeddings_metadata_path) and not force_refresh:
-            try:
-                with open(embeddings_path, 'r', encoding='utf-8') as f:
-                    cached_embeddings = json.load(f)
+        try:
+            # Load repository data
+            if not os.path.exists(self.repo_data_path):
+                logger.error(f"Repository data not found at {self.repo_data_path}")
+                return {}
                 
-                with open(embeddings_metadata_path, 'r', encoding='utf-8') as f:
-                    cache_metadata = json.load(f)
+            with open(self.repo_data_path, "r", encoding="utf-8") as f:
+                repo_data = json.load(f)
                 
-                # Check if the cache is valid
-                if cache_metadata.get('model') == self.embedding_model:
-                    embeddings_data = cached_embeddings
-                    logger.info(f"Loaded existing embeddings cache from {embeddings_path}")
-                    
-                    # Keep existing repository ID
-                    if 'repository_id' in cache_metadata:
-                        embeddings_data['repository_id'] = cache_metadata['repository_id']
-            
-            except Exception as e:
-                logger.warning(f"Failed to load embeddings cache: {str(e)}")
-        
-        # Get the list of files to process
-        files_to_process = []
-        content_hashes = {}
-        
-        for file_entry in self.repo_data.get('files', []):
-            file_path = file_entry.get('metadata', {}).get('path', '')
-            
-            if not file_path:
-                continue
-            
-            # Get file content
-            content = self._get_file_content(file_entry)
-            
-            if not content:
-                continue
-            
-            # Compute content hash
-            content_hash = self._hash_content(content)
-            content_hashes[file_path] = content_hash
-            
-            # Check if we need to process this file
-            need_processing = True
-            
-            # Skip if the file is already in the cache and the content hasn't changed
-            if file_path in embeddings_data.get('files', {}) and not force_refresh:
-                cached_hash = embeddings_data['files'][file_path].get('hash')
-                if cached_hash == content_hash:
-                    need_processing = False
-                    logger.debug(f"Skipping unchanged file: {file_path}")
-            
-            if need_processing:
-                files_to_process.append((file_path, content, file_entry))
-        
-        # Generate embeddings for files that need processing
-        if files_to_process:
-            logger.info(f"Generating embeddings for {len(files_to_process)} files")
-            
-            # Create embedding tasks
-            tasks = []
-            
-            for file_path, content, file_entry in files_to_process:
-                # Split content into chunks
-                chunks = self._chunk_content(content, self.chunk_size)
+            if not repo_data.get("files"):
+                logger.warning("No files found in repository data")
+                return {}
                 
-                # Create tasks for embedding generation
-                for chunk in chunks:
-                    tasks.append((file_path, chunk, content_hashes[file_path], file_entry))
+            # Generate embeddings for each file with content
+            file_embeddings = {}
+            files_with_embeddings = 0
             
-            # Process tasks in parallel
-            chunk_results = []
+            for file_entry in repo_data["files"]:
+                # Skip files without content
+                if not file_entry.get("content"):
+                    continue
             
-            async def process_chunk(task_data):
-                file_path, chunk_content, content_hash, file_entry = task_data
-                embedding = await self._generate_embedding(chunk_content)
-                return {
-                    'file_path': file_path,
-                    'content': chunk_content,
-                    'hash': content_hash,
-                    'embedding': embedding,
-                    'file_entry': file_entry
-                }
+                # Get and normalize file path
+                file_path = file_entry["metadata"]["path"]
+                normalized_path = file_path.replace('\\', '/')
             
-            # Run tasks with progress bar
-            async_tasks = [process_chunk(task) for task in tasks]
-            for result in await tqdm_asyncio.gather(*async_tasks, desc="Generating embeddings"):
-                chunk_results.append(result)
+                # Skip files that already have embeddings
+                if normalized_path in file_embeddings:
+                    continue
             
-            # Organize results by file
-            for result in chunk_results:
-                file_path = result['file_path']
-                file_entry = result['file_entry']
+                # Generate embedding for file content
+                content = file_entry["content"]
+                embedding = asyncio.run(self._generate_embedding(content))
                 
-                # Initialize file entry if needed
-                if file_path not in embeddings_data['files']:
-                    embeddings_data['files'][file_path] = {
-                        'metadata': file_entry.get('metadata', {}),
-                        'hash': result['hash'],
-                        'lines': file_entry.get('lines', 0),
-                        'chunks': []
+                if embedding and len(embedding) > 0:
+                    file_embeddings[normalized_path] = {
+                        "path": normalized_path,
+                        "embedding": embedding,
+                        "content_hash": self._hash_content(content)
                     }
+                    files_with_embeddings += 1
+            
+            logger.info(f"Generated embeddings for {files_with_embeddings} files")
+            
+            # Save embeddings locally
+            with open(self.file_embeddings_path, "w", encoding="utf-8") as f:
+                json.dump(file_embeddings, f)
                 
-                # Add chunk data
-                embeddings_data['files'][file_path]['chunks'].append({
-                    'content': result['content'],
-                    'embedding': result['embedding'],
-                    'hash': result['hash']
-                })
+            logger.info(f"Saved file embeddings to {self.file_embeddings_path}")
             
-            # Save embeddings to disk
-            with open(embeddings_path, 'w', encoding='utf-8') as f:
-                json.dump(embeddings_data, f)
+            # Store in Supabase if available
+            if self.use_supabase:
+                success = self._store_embeddings_to_supabase(file_embeddings)
+                if not success:
+                    logger.warning("Failed to store embeddings in Supabase")
             
-            # Save metadata
-            cache_metadata = {
-                'model': self.embedding_model,
-                'generated_at': datetime.now(timezone.utc).isoformat(),
-                'file_count': len(embeddings_data['files']),
-                'repository_id': embeddings_data.get('repository_id')
-            }
+            return file_embeddings
             
-            with open(embeddings_metadata_path, 'w', encoding='utf-8') as f:
-                json.dump(cache_metadata, f)
-            
-            logger.info(f"Embeddings saved to {embeddings_path}")
-        else:
-            logger.info("No files need embedding updates")
-        
-        # Store embeddings in Supabase if enabled
-        if self.use_supabase and self.supabase:
-            self._store_embeddings_to_supabase(embeddings_data)
-        
-        return embeddings_data
+        except Exception as e:
+            logger.error(f"Error generating file embeddings: {e}")
+            logger.error(traceback.format_exc())
+            return {}
     
     def find_similar_files(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -520,7 +401,7 @@ class RepositoryAnalyzer:
             
             if not repository_id:
                 # Try to find repository by name
-                repo_name = self.repo_data.get('name', '')
+                repo_name = repo_data.get('name', '')
                 if repo_name:
                     response = self.supabase.table('repositories').select('id').eq('name', repo_name).execute()
                     if response.data:
@@ -648,7 +529,7 @@ class RepositoryAnalyzer:
         # Generate embeddings
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        embeddings_data = loop.run_until_complete(self.generate_embeddings(force_refresh))
+        embeddings_data = loop.run_until_complete(self.generate_file_embeddings())
         loop.close()
         
         # Perform additional analysis if needed
@@ -658,9 +539,9 @@ class RepositoryAnalyzer:
         analysis_path = os.path.join(self.output_dir, 'repository_analysis.json')
         
         analysis_results = {
-            'repository_name': self.repo_data.get('name', 'unknown'),
+            'repository_name': repo_data.get('name', 'unknown'),
             'embedding_model': self.embedding_model,
-            'file_count': len(embeddings_data.get('files', {})),
+            'file_count': len(embeddings_data),
             'generated_at': datetime.now(timezone.utc).isoformat()
         }
         
@@ -724,3 +605,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Error analyzing repository: {str(e)}")
         raise
+

@@ -494,6 +494,19 @@ def process_repository_with_ast(repo_path: str, output_dir: Optional[str] = None
         repo_id = db.process_repository(repo_data)
         
         if repo_id:
+            # Generate and store a text digest of the repository
+            logger.info("Generating repository digest...")
+            digest_text = ingestor.get_repository_digest()
+            
+            # Store the digest text in the database
+            logger.info("Storing repository digest in database...")
+            digest_success = db.store_repository_digest(repo_id, digest_text)
+            
+            if digest_success:
+                logger.info(f"Repository digest stored successfully for repository {repo_id}")
+            else:
+                logger.warning(f"Failed to store repository digest for repository {repo_id}")
+                
             logger.info(f"Repository {repo_data['name']} completely processed and stored in database")
             return repo_id
         else:

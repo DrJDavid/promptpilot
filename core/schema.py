@@ -1,77 +1,106 @@
-from sgqlc.types import Schema, Type, Field, NonNull, Int, String, List, Float
+"""
+GraphQL schema implementation for PromptPilot.
+This defines the GraphQL schema for querying repository data via Supabase PostgreSQL database.
+"""
 
-# Define GraphQL types, mirroring your Supabase schema
+from sgqlc.types import Type, Field, list_of, String, Int, Float, ID, Boolean, non_null
+from sgqlc.types.relay import Node, Connection, connection_args
+from sgqlc.operation import Operation
 
-class Function(Type):
-    __typename__ = 'functions' # MUST match the table name in Supabase
-    id = Field(NonNull(Int))
-    name = Field(NonNull(String))
-    signature = Field(String)
-    docstring = Field(String)
-    body = Field(String) # Might want to omit or truncate this
-    start_line = Field(Int)
-    end_line = Field(Int)
-    file_id = Field(Int) # Add file_id and repo
-    repository_id = Field(Int)
-
-class Class(Type):
-    __typename__ = 'classes'
-    id = Field(NonNull(Int))
-    name = Field(NonNull(String))
-    docstring = Field(String)
-    body = Field(String) # Might want to omit or truncate
-    start_line = Field(Int)
-    end_line = Field(Int)
-    file_id = Field(Int) # Add file_id and repo
-    repository_id = Field(Int)
-
-class Import(Type):  # Added import type.
-    __typename__ = 'imports'
-    id = Field(NonNull(Int))
-    statement = Field(NonNull(String))
-    line = Field(Int)
-    file_id = Field(Int)  # Add file_id and repo
-    repository_id = Field(Int)
-
-
+# Base types
 class File(Type):
-    __typename__ = 'files'
-    id = Field(NonNull(Int))
-    path = Field(NonNull(String))
-    repository_id = Field(NonNull(Int))
-    content = Field(String)  # Probably don't fetch this, use content_url
-    content_url = Field(String) #Definitely want this
-    similarity = Field(Float) #for the query
-    functions = Field(List(Function))  # Relationship to functions
-    classes = Field(List(Class))      # Relationship to classes
-    imports = Field(List(Import)) # Relationship to imports
-
+    """File entity representing a file in a repository."""
+    id = ID
+    repository_id = ID
+    path = String
+    content = String
+    size_bytes = Int
+    extension = String
+    last_modified = String  # timestamp
+    lines = Int
+    characters = Int
+    content_url = String
+    content_hash = String
+    embedding = String  # Vector type, represented as string in GraphQL
+    similarity = Float
+    
+class Function(Type):
+    """Function entity representing a function in a repository."""
+    id = ID
+    file_id = ID
+    repository_id = ID
+    name = String
+    signature = String
+    docstring = String
+    body = String
+    start_line = Int
+    end_line = Int
+    similarity = Float
+    
+class Class(Type):
+    """Class entity representing a class in a repository."""
+    id = ID
+    file_id = ID
+    repository_id = ID
+    name = String
+    docstring = String
+    body = String
+    start_line = Int
+    end_line = Int
+    similarity = Float
+    
+class Import(Type):
+    """Import entity representing an import statement in a repository."""
+    id = ID
+    file_id = ID
+    repository_id = ID
+    statement = String
+    line = Int
+    
 class Repository(Type):
-    __typename__ = 'repositories'
-    id = Field(NonNull(Int))
-    name = Field(NonNull(String))
-    path = Field(String) # Keep path
-    files = Field(List(File)) # Add relationship, so we can use nested queries
-
-# Root Query type
+    """Repository entity containing files, functions, classes, and imports."""
+    id = ID
+    name = String
+    path = String
+    file_count = Int
+    total_size_bytes = Int
+    file_types = String  # JSON type, represented as string in GraphQL
+    processed_date = String  # timestamp
+    
+    # Define resolvers for embeddings-based semantic search
+    files = Field(list_of(File), args={
+        'search': String,
+        'similarityThreshold': Float,
+        'limit': Int
+    })
+    
+    functions = Field(list_of(Function), args={
+        'search': String,
+        'similarityThreshold': Float,
+        'limit': Int
+    })
+    
+    classes = Field(list_of(Class), args={
+        'search': String,
+        'similarityThreshold': Float,
+        'limit': Int
+    })
+    
+    imports = Field(list_of(Import), args={
+        'limit': Int
+    })
+    
 class Query(Type):
-    __typename__ = 'Query'
-    # Search
-    match_code_files = Field(
-        List(File),
-        args={
-            'repo_id': Int,
-            'query_embedding': NonNull(List(NonNull(Float))), # Add NonNull
-            'match_threshold': Float,
-            'match_count': Int
-        }
-    )
-    # Add a way to query for a specific file
-    file_by_path = Field(File, args={'repo_id': Int, 'path': String})
-    #get a single repository
-    repository = Field(Repository, args={'id': Int})
-    #get all repositories.
-    repositories = Field(List(Repository))
-
-# Create the schema
-schema = Schema(query=Query) 
+    """Root query type."""
+    repository = Field(Repository, args={'id': ID})
+    repositories = Field(list_of(Repository), args={
+        'where': String,  # JSON argument for filtering
+        'limit': Int,
+        'offset': Int,
+        'order': String  # JSON for ordering
+    })
+    
+# Create schema
+schema = {
+    'query': Query
+} 

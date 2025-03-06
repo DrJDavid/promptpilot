@@ -8,6 +8,7 @@ PromptPilot is a tool for analyzing code repositories and generating intelligent
 - Code embedding generation and storage using Supabase pgvector
 - Semantic code search using vector similarity
 - AI-enhanced code understanding and prompt generation
+- Simple CLI interface to interact with repositories
 
 ## Setup
 
@@ -27,10 +28,21 @@ PromptPilot is a tool for analyzing code repositories and generating intelligent
    # or
    venv\Scripts\activate     # Windows
    ```
-3. Install dependencies
-   ```bash
-   pip install -r requirements.txt
-   ```
+
+3. You can either:
+   
+   - Install dependencies normally:
+     ```bash
+     pip install -r requirements.txt
+     ```
+   
+   - Or install as a CLI tool (recommended for easier usage):
+     ```bash
+     pip install -e .
+     ```
+     After installation, you can run the tool with just `promptpilot` instead of `python promptpilot.py`
+
+For more detailed installation instructions, see [INSTALL.md](INSTALL.md).
 
 ### Supabase Configuration
 

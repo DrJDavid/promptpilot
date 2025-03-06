@@ -9,8 +9,8 @@ analysis, AST parsing, prompt generation, and database integration.
 from core.ingest import RepositoryIngestor, ingest_repository
 from core.analyze import RepositoryAnalyzer
 from core.ast_analyzer import ASTAnalyzer
-from core.enhanced_prompt_generator import PromptGenerator
-from core.enhanced_db import RepositoryDB, get_repository_db
+from core.fixed_prompt_generator import PromptGenerator
+from core.enhanced_db import RepositoryDB, get_db
 
 __all__ = [
     'RepositoryIngestor',
@@ -19,5 +19,5 @@ __all__ = [
     'ASTAnalyzer',
     'PromptGenerator',
     'RepositoryDB',
-    'get_repository_db',
+    'get_db',
 ]

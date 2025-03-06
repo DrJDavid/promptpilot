@@ -12,6 +12,7 @@ import logging
 from collections import Counter, defaultdict
 import uuid
 import time
+import traceback
 
 # git package is provided by the gitpython library
 # If you're seeing an import error, run: pip install gitpython
@@ -270,7 +271,7 @@ class RepositoryIngestor:
             logger.error(f"Failed to upload {file_path} to Supabase: {e}")
             return None
     
-    def process_repository(self) -> Dict[str, Any]:
+    def _process_repository(self) -> Dict[str, Any]:
         """
         Process the repository and extract all relevant information.
         
@@ -330,50 +331,119 @@ class RepositoryIngestor:
             'files': processed_files
         }
         
+        # Extract metadata and save to disk
+        metadata = {
+            'name': repo_summary['name'],
+            'path': repo_summary['path'],
+            'file_count': repo_summary['file_count'],
+            'total_size_bytes': repo_summary['total_size_bytes'],
+            'file_types': repo_summary['file_types'],
+            'processed_date': repo_summary['processed_date']
+        }
+        
         # Save to disk
-        self._save_repository_data(repo_summary)
+        self.save_repository_data(metadata, repo_summary, self.output_dir)
         
         return repo_summary
     
-    def _save_repository_data(self, repo_data: Dict[str, Any]) -> None:
+    def save_repository_data(self, repository_metadata: Dict[str, Any], repository_data: Dict[str, Any], output_dir: str) -> Optional[int]:
         """
-        Save repository data to disk.
+        Save repository data to the output directory and database.
         
         Args:
-            repo_data: Repository data dictionary
+            repository_metadata: Repository metadata (name, path, etc.)
+            repository_data: Repository data (files, etc.)
+            output_dir: Output directory
+            
+        Returns:
+            Optional repository ID if stored in the database, None otherwise
         """
-        # Save metadata separately from content to make it easier to read
-        metadata_only = {
-            'name': repo_data['name'],
-            'path': repo_data['path'],
-            'file_count': repo_data['file_count'],
-            'total_size_bytes': repo_data['total_size_bytes'],
-            'file_types': repo_data['file_types'],
-            'processed_date': repo_data['processed_date'],
-            'files': [
-                {
-                    'metadata': file_entry['metadata'],
-                    'lines': file_entry['lines'],
-                    'characters': file_entry['characters'],
-                    'content_url': file_entry.get('content_url')
-                }
-                for file_entry in repo_data['files']
-            ]
-        }
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
         
-        # Save metadata
-        metadata_path = os.path.join(self.output_dir, 'repository_metadata.json')
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata_only, f, indent=2)
+        # Store in database if available
+        repo_id = None
+        if self.supabase:
+            try:
+                # Store repository metadata in database using enhanced_db
+                logger.info(f"Storing repository metadata for {repository_metadata['name']} in database")
+                try:
+                    from core.enhanced_db import RepositoryDB
+                    db = RepositoryDB()
+                    
+                    if db and db.is_available():
+                        repo_id = db.store_repository(repository_metadata)
+                        
+                        if repo_id:
+                            logger.info(f"Repository stored with ID: {repo_id}")
+                            # Add repository ID to metadata and data
+                            repository_metadata['id'] = repo_id
+                            repository_data['id'] = repo_id
+                            
+                            # Store files with repository ID (would need to add this method to RepositoryDB if needed)
+                            # for file_entry in repository_data.get('files', []):
+                            #     if 'content' in file_entry:
+                            #         logger.debug(f"Storing file {file_entry['metadata']['path']} in database")
+                            #         try:
+                            #             file_id = db.store_file(repo_id, file_entry)
+                            #             if file_id:
+                            #                 file_entry['id'] = file_id
+                            #         except Exception as file_err:
+                            #             logger.error(f"Error storing file {file_entry['metadata']['path']}: {str(file_err)}")
+
+                            # Store all files with repository ID
+                            try:
+                                files = repository_data.get('files', [])
+                                if files:
+                                    logger.info(f"Storing {len(files)} files in database for repository {repo_id}")
+                                    success = db.store_files(repo_id, files)
+                                    if success:
+                                        logger.info(f"Successfully stored files for repository {repo_id}")
+                                    else:
+                                        logger.warning(f"Failed to store files for repository {repo_id}")
+                            except Exception as file_err:
+                                logger.error(f"Error storing files: {str(file_err)}")
+                    else:
+                        logger.error("Database not available")
+                except ImportError:
+                    logger.error("Enhanced database module not available")
+                except Exception as db_err:
+                    logger.error(f"Error with database operations: {str(db_err)}")
+            except Exception as e:
+                logger.error(f"Error storing repository data in database: {str(e)}")
+                logger.error(traceback.format_exc())
         
-        logger.info(f"Repository metadata saved to {metadata_path}")
+        # Save metadata to JSON file
+        metadata_path = os.path.join(output_dir, 'repository_metadata.json')
+        try:
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(repository_metadata, f, indent=2)
+                logger.info(f"Repository metadata saved to {metadata_path}")
+        except Exception as e:
+            logger.error(f"Error saving repository metadata: {str(e)}")
         
-        # Save full data (including content)
-        full_data_path = os.path.join(self.output_dir, 'repository_data.json')
-        with open(full_data_path, 'w', encoding='utf-8') as f:
-            json.dump(repo_data, f)
+        # Save repository data to JSON file
+        data_path = os.path.join(output_dir, 'repository_data.json')
+        try:
+            with open(data_path, 'w', encoding='utf-8') as f:
+                json.dump(repository_data, f, indent=2)
+                logger.info(f"Repository data saved to {data_path}")
+        except Exception as e:
+            logger.error(f"Error saving repository data: {str(e)}")
         
-        logger.info(f"Full repository data saved to {full_data_path}")
+        # Save repository ID to a dedicated file for easier retrieval
+        if repo_id:
+            id_path = os.path.join(output_dir, 'repository_id.txt')
+            try:
+                with open(id_path, 'w', encoding='utf-8') as f:
+                    f.write(str(repo_id))
+                    logger.info(f"Repository ID saved to {id_path}")
+            except Exception as e:
+                logger.error(f"Error saving repository ID: {str(e)}")
+        
+        # Return success message
+        logger.info(f"Repository data saved to {output_dir} with ID: {repo_id if repo_id else 'None'}")
+        return repo_id
     
     def get_repository_digest(self) -> str:
         """
@@ -430,6 +500,68 @@ class RepositoryIngestor:
         
         return "\n".join(digest)
 
+    def process(self, apply_ast_analysis=True) -> Dict[str, Any]:
+        """
+        Process the repository to extract all relevant data.
+        
+        Args:
+            apply_ast_analysis: Whether to apply AST analysis to extract code structures
+            
+        Returns:
+            Repository data
+        """
+        logger.info(f"Processing repository: {self.repo_path}")
+        
+        # Process repository
+        repository_data = self._process_repository()
+        
+        # Extract metadata 
+        metadata = {
+            'name': repository_data.get('name', 'unknown'),
+            'path': repository_data.get('path', ''),
+            'file_count': repository_data.get('file_count', 0),
+            'total_size_bytes': repository_data.get('total_size_bytes', 0),
+            'file_types': repository_data.get('file_types', {}),
+            'processed_date': repository_data.get('processed_date', time.time()),
+        }
+        
+        # Apply AST analysis if requested
+        if apply_ast_analysis:
+            try:
+                from core.ast_analyzer import RepositoryASTAnalyzer
+                
+                # Create AST analyzer and process
+                ast_analyzer = RepositoryASTAnalyzer(self.output_dir)
+                ast_result = ast_analyzer.analyze()
+                
+                # Merge AST results if successful
+                if ast_result and isinstance(ast_result, dict):
+                    # Include AST results in repository data
+                    repository_data['functions'] = ast_result.get('functions', [])
+                    repository_data['classes'] = ast_result.get('classes', [])
+                    repository_data['imports'] = ast_result.get('imports', [])
+                    logger.info(f"AST analysis complete: {len(ast_result.get('functions', []))} functions, "
+                            f"{len(ast_result.get('classes', []))} classes, "
+                            f"{len(ast_result.get('imports', []))} imports")
+                    
+                    # Also update metadata with function, class, and import counts
+                    metadata['function_count'] = len(ast_result.get('functions', []))
+                    metadata['class_count'] = len(ast_result.get('classes', []))
+                    metadata['import_count'] = len(ast_result.get('imports', []))
+            except Exception as e:
+                logger.error(f"Error during AST analysis: {str(e)}")
+                logger.warning("The repository was still processed, but AST analysis was incomplete.")
+        
+        # Save repository data and get ID
+        repo_id = self.save_repository_data(metadata, repository_data, self.output_dir)
+        
+        # Add repo_id to both objects if available
+        if repo_id:
+            metadata['id'] = repo_id
+            repository_data['id'] = repo_id
+        
+        return repository_data
+
 
 # Standalone function for simpler use cases
 def ingest_repository(repo_path: str, output_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -444,7 +576,7 @@ def ingest_repository(repo_path: str, output_dir: Optional[str] = None) -> Dict[
         Dictionary containing repository information
     """
     ingestor = RepositoryIngestor(repo_path, output_dir)
-    return ingestor.process_repository()
+    return ingestor.process()
 
 
 if __name__ == "__main__":
@@ -458,7 +590,7 @@ if __name__ == "__main__":
     
     try:
         ingestor = RepositoryIngestor(args.repo_path, args.output)
-        repo_data = ingestor.process_repository()
+        repo_data = ingestor.process()
         
         # Generate and print digest
         digest = ingestor.get_repository_digest()

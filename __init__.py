@@ -13,7 +13,7 @@ from core.ingest import ingest_repository
 from core.analyze import RepositoryAnalyzer
 from core.ast_analyzer import ASTAnalyzer
 from core.enhanced_prompt_generator import PromptGenerator
-from core.enhanced_db import get_repository_db
+from core.enhanced_db import get_db
 
 # Convenience function for CLI usage
 def get_version():

@@ -1,74 +1,55 @@
 """
 AST (Abstract Syntax Tree) analyzer module for PromptPilot.
 
-This module handles the Tree-sitter integration for generating and analyzing
-AST representations of code files.
+This module handles the analysis of code files to extract functions, 
+classes, and imports - using regex-based parsing as a fallback for tree-sitter.
 """
 
 import os
 import json
 import logging
-import tempfile
-import subprocess
-from typing import Dict, List, Any, Optional, Tuple
-from pathlib import Path
-import platform
-import importlib.util
 import re
+from typing import Dict, List, Any, Optional
 from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('promptpilot.ast_analyzer')
 
-# Try to import tree-sitter or mark as unavailable
+# Check for tree-sitter
 try:
     from tree_sitter import Language, Parser
     TREE_SITTER_AVAILABLE = True
     logger.info("Tree-sitter is available")
 except ImportError:
     TREE_SITTER_AVAILABLE = False
-    logger.warning("Tree-sitter is not available (pip install tree-sitter)")
+    logger.warning("Tree-sitter is not available, using regex-based fallback")
 
-
-# Supported languages and their tree-sitter grammar repositories
+# Supported languages
 SUPPORTED_LANGUAGES = {
     'python': {
         'extensions': ['.py'],
-        'repo': 'https://github.com/tree-sitter/tree-sitter-python',
-        'parser_file': 'python.so',
     },
     'javascript': {
         'extensions': ['.js', '.jsx'],
-        'repo': 'https://github.com/tree-sitter/tree-sitter-javascript',
-        'parser_file': 'javascript.so',
     },
     'typescript': {
         'extensions': ['.ts', '.tsx'],
-        'repo': 'https://github.com/tree-sitter/tree-sitter-typescript',
-        'parser_file': 'typescript.so',
-        'scope': 'typescript/src'
     },
     'java': {
         'extensions': ['.java'],
-        'repo': 'https://github.com/tree-sitter/tree-sitter-java',
-        'parser_file': 'java.so',
     },
     'c': {
         'extensions': ['.c', '.h'],
-        'repo': 'https://github.com/tree-sitter/tree-sitter-c',
-        'parser_file': 'c.so',
     },
     'cpp': {
         'extensions': ['.cpp', '.hpp', '.cc', '.h'],
-        'repo': 'https://github.com/tree-sitter/tree-sitter-cpp',
-        'parser_file': 'cpp.so',
     },
 }
 
 
 class ASTAnalyzer:
-    """Class to analyze code files using Tree-sitter."""
+    """Class to analyze code files and extract functions, classes, and imports."""
     
     def __init__(self, repository_dir: str):
         """
@@ -87,59 +68,12 @@ class ASTAnalyzer:
         # Output path
         self.ast_data_path = os.path.join(repository_dir, 'ast_data.json')
         
-        # Set up tree-sitter parsers directory
+        # Set up parsers directory (not actually used in fallback mode)
         self.parsers_dir = os.path.join(repository_dir, 'parsers')
         os.makedirs(self.parsers_dir, exist_ok=True)
         
-        # Initialize parsers if tree-sitter is available
+        # For compatibility
         self.parsers = {}
-        if TREE_SITTER_AVAILABLE:
-            self._initialize_parsers()
-    
-    def _initialize_parsers(self) -> None:
-        """Initialize tree-sitter parsers for supported languages."""
-        # Check if parsers already exist
-        if all(os.path.exists(os.path.join(self.parsers_dir, lang_info['parser_file'])) 
-               for lang_info in SUPPORTED_LANGUAGES.values()):
-            # Load existing parsers
-            for lang, lang_info in SUPPORTED_LANGUAGES.items():
-                try:
-                    parser_path = os.path.join(self.parsers_dir, lang_info['parser_file'])
-                    Language.build_library(parser_path, [os.path.join(self.parsers_dir, lang)])
-                    
-                    self.parsers[lang] = Parser()
-                    self.parsers[lang].set_language(Language(parser_path, lang))
-                    logger.info(f"Loaded parser for {lang}")
-                except Exception as e:
-                    logger.error(f"Error loading parser for {lang}: {str(e)}")
-            return
-        
-        # Build parsers
-        logger.info("Building tree-sitter parsers (this may take a moment)...")
-        
-        for lang, lang_info in SUPPORTED_LANGUAGES.items():
-            try:
-                # Clone repository if needed
-                lang_dir = os.path.join(self.parsers_dir, lang)
-                if not os.path.exists(lang_dir):
-                    logger.info(f"Cloning {lang} grammar repository...")
-                    subprocess.run(
-                        ['git', 'clone', lang_info['repo'], lang_dir],
-                        check=True, capture_output=True
-                    )
-                
-                # Build parser
-                parser_path = os.path.join(self.parsers_dir, lang_info['parser_file'])
-                scope = [os.path.join(lang_dir, lang_info.get('scope', ''))]
-                Language.build_library(parser_path, scope)
-                
-                # Initialize parser
-                self.parsers[lang] = Parser()
-                self.parsers[lang].set_language(Language(parser_path, lang))
-                logger.info(f"Built parser for {lang}")
-                
-            except Exception as e:
-                logger.error(f"Error building parser for {lang}: {str(e)}")
     
     def _load_repository_data(self) -> Dict[str, Any]:
         """
@@ -181,438 +115,9 @@ class ASTAnalyzer:
         
         return None
     
-    def _extract_text_from_node(self, code_bytes: bytes, node) -> str:
-        """
-        Extract text from a node in the AST.
-        
-        Args:
-            code_bytes: Source code as bytes
-            node: Tree-sitter node
-            
-        Returns:
-            Text content of the node
-        """
-        start_byte = node.start_byte
-        end_byte = node.end_byte
-        return code_bytes[start_byte:end_byte].decode('utf-8')
-    
-    def _extract_functions_from_python(self, code_bytes: bytes, root_node) -> List[Dict[str, Any]]:
-        """
-        Extract functions from a Python AST.
-        
-        Args:
-            code_bytes: Source code as bytes
-            root_node: Root node of the AST
-            
-        Returns:
-            List of function information dictionaries
-        """
-        functions = []
-        query_string = """
-        (function_definition
-          name: (identifier) @function_name
-          parameters: (parameters) @parameters
-          body: (block) @body) @function_def
-        """
-        
-        parser = self.parsers['python']
-        query = parser.language.query(query_string)
-        captures = query.captures(root_node)
-        
-        # Group captures by function
-        functions_data = {}
-        for capture in captures:
-            node, label = capture
-            function_id = node.id if label == 'function_def' else None
-            
-            if function_id is not None:
-                if function_id not in functions_data:
-                    functions_data[function_id] = {'node': node}
-                functions_data[function_id]['full_node'] = node
-            elif label == 'function_name':
-                parent_id = node.parent.parent.id
-                if parent_id in functions_data:
-                    functions_data[parent_id]['name_node'] = node
-            elif label == 'parameters':
-                parent_id = node.parent.id
-                if parent_id in functions_data:
-                    functions_data[parent_id]['parameters_node'] = node
-            elif label == 'body':
-                parent_id = node.parent.id
-                if parent_id in functions_data:
-                    functions_data[parent_id]['body_node'] = node
-        
-        # Extract function information
-        for func_id, data in functions_data.items():
-            if 'name_node' in data and 'parameters_node' in data:
-                function_name = self._extract_text_from_node(code_bytes, data['name_node'])
-                parameters = self._extract_text_from_node(code_bytes, data['parameters_node'])
-                
-                # Extract docstring if present
-                docstring = ""
-                if 'body_node' in data:
-                    body_node = data['body_node']
-                    expressions = [child for child in body_node.children if child.type == 'expression_statement']
-                    if expressions and len(expressions) > 0:
-                        first_expr = expressions[0]
-                        if first_expr.children and first_expr.children[0].type == 'string':
-                            docstring = self._extract_text_from_node(code_bytes, first_expr.children[0])
-                            # Clean up quotes from docstring
-                            docstring = docstring.strip('"\'').strip()
-                
-                # Extract full function text
-                full_function = self._extract_text_from_node(code_bytes, data['full_node'])
-                
-                functions.append({
-                    'name': function_name,
-                    'signature': f"def {function_name}{parameters}:",
-                    'docstring': docstring,
-                    'body': full_function,
-                    'start_line': data['full_node'].start_point[0] + 1,
-                    'end_line': data['full_node'].end_point[0] + 1
-                })
-        
-        return functions
-    
-    def _extract_classes_from_python(self, code_bytes: bytes, root_node) -> List[Dict[str, Any]]:
-        """
-        Extract classes from a Python AST.
-        
-        Args:
-            code_bytes: Source code as bytes
-            root_node: Root node of the AST
-            
-        Returns:
-            List of class information dictionaries
-        """
-        classes = []
-        query_string = """
-        (class_definition
-          name: (identifier) @class_name
-          body: (block) @body) @class_def
-        """
-        
-        parser = self.parsers['python']
-        query = parser.language.query(query_string)
-        captures = query.captures(root_node)
-        
-        # Group captures by class
-        classes_data = {}
-        for capture in captures:
-            node, label = capture
-            class_id = node.id if label == 'class_def' else None
-            
-            if class_id is not None:
-                if class_id not in classes_data:
-                    classes_data[class_id] = {'node': node}
-                classes_data[class_id]['full_node'] = node
-            elif label == 'class_name':
-                parent_id = node.parent.id
-                if parent_id in classes_data:
-                    classes_data[parent_id]['name_node'] = node
-            elif label == 'body':
-                parent_id = node.parent.id
-                if parent_id in classes_data:
-                    classes_data[parent_id]['body_node'] = node
-        
-        # Extract class information
-        for class_id, data in classes_data.items():
-            if 'name_node' in data:
-                class_name = self._extract_text_from_node(code_bytes, data['name_node'])
-                
-                # Extract docstring if present
-                docstring = ""
-                if 'body_node' in data:
-                    body_node = data['body_node']
-                    expressions = [child for child in body_node.children if child.type == 'expression_statement']
-                    if expressions and len(expressions) > 0:
-                        first_expr = expressions[0]
-                        if first_expr.children and first_expr.children[0].type == 'string':
-                            docstring = self._extract_text_from_node(code_bytes, first_expr.children[0])
-                            # Clean up quotes from docstring
-                            docstring = docstring.strip('"\'').strip()
-                
-                # Extract full class text
-                full_class = self._extract_text_from_node(code_bytes, data['full_node'])
-                
-                classes.append({
-                    'name': class_name,
-                    'docstring': docstring,
-                    'body': full_class,
-                    'start_line': data['full_node'].start_point[0] + 1,
-                    'end_line': data['full_node'].end_point[0] + 1
-                })
-        
-        return classes
-    
-    def _extract_imports_from_python(self, code_bytes: bytes, root_node) -> List[Dict[str, Any]]:
-        """
-        Extract imports from a Python AST.
-        
-        Args:
-            code_bytes: Source code as bytes
-            root_node: Root node of the AST
-            
-        Returns:
-            List of import information dictionaries
-        """
-        imports = []
-        query_string = """
-        (import_statement) @import
-        (import_from_statement) @import_from
-        """
-        
-        parser = self.parsers['python']
-        query = parser.language.query(query_string)
-        captures = query.captures(root_node)
-        
-        for capture in captures:
-            node, _ = capture
-            import_text = self._extract_text_from_node(code_bytes, node)
-            
-            imports.append({
-                'statement': import_text,
-                'line': node.start_point[0] + 1
-            })
-        
-        return imports
-    
-    def _extract_functions_from_js_ts(self, code_bytes: bytes, root_node) -> List[Dict[str, Any]]:
-        """
-        Extract functions from a JavaScript/TypeScript AST.
-        
-        Args:
-            code_bytes: Source code as bytes
-            root_node: Root node of the AST
-            
-        Returns:
-            List of function information dictionaries
-        """
-        functions = []
-        query_string = """
-        (function_declaration
-          name: (identifier) @function_name
-          parameters: (formal_parameters) @parameters
-          body: (statement_block) @body) @function_decl
-          
-        (method_definition
-          name: (property_identifier) @method_name
-          parameters: (formal_parameters) @method_parameters
-          body: (statement_block) @method_body) @method_def
-          
-        (arrow_function
-          parameters: (formal_parameters) @arrow_params
-          body: (_) @arrow_body) @arrow_func
-        """
-        
-        lang = 'javascript'
-        if 'typescript' in self.parsers:
-            lang = 'typescript'
-            
-        parser = self.parsers[lang]
-        query = parser.language.query(query_string)
-        captures = query.captures(root_node)
-        
-        # Group captures by function
-        functions_data = {}
-        for capture in captures:
-            node, label = capture
-            
-            if label in ('function_decl', 'method_def', 'arrow_func'):
-                if node.id not in functions_data:
-                    functions_data[node.id] = {'node': node, 'type': label}
-            elif label in ('function_name', 'method_name'):
-                parent_id = node.parent.id
-                if parent_id in functions_data:
-                    functions_data[parent_id]['name_node'] = node
-            elif label in ('parameters', 'method_parameters', 'arrow_params'):
-                parent_id = node.parent.id
-                if parent_id in functions_data:
-                    functions_data[parent_id]['parameters_node'] = node
-            elif label in ('body', 'method_body', 'arrow_body'):
-                parent_id = node.parent.id
-                if parent_id in functions_data:
-                    functions_data[parent_id]['body_node'] = node
-        
-        # Extract function information
-        for func_id, data in functions_data.items():
-            func_node = data['node']
-            func_type = data.get('type', '')
-            
-            # Get function name if available
-            function_name = "anonymous"
-            if 'name_node' in data:
-                function_name = self._extract_text_from_node(code_bytes, data['name_node'])
-            elif func_type == 'arrow_func':
-                # Try to get variable name for arrow functions
-                parent = func_node.parent
-                if parent and parent.type == 'variable_declarator':
-                    grandparent = parent.parent
-                    if grandparent and grandparent.type == 'lexical_declaration':
-                        for child in grandparent.children:
-                            if child.type == 'variable_declarator':
-                                for subchild in child.children:
-                                    if subchild.type == 'identifier':
-                                        function_name = self._extract_text_from_node(code_bytes, subchild)
-                                        break
-            
-            # Get parameters if available
-            parameters = ""
-            if 'parameters_node' in data:
-                parameters = self._extract_text_from_node(code_bytes, data['parameters_node'])
-            
-            # Extract full function text
-            full_function = self._extract_text_from_node(code_bytes, func_node)
-            
-            # Define signature based on function type
-            signature = ""
-            if func_type == 'function_decl':
-                signature = f"function {function_name}{parameters}"
-            elif func_type == 'method_def':
-                signature = f"{function_name}{parameters}"
-            elif func_type == 'arrow_func':
-                signature = f"{function_name} = {parameters} =>"
-            
-            # Get JSDoc comments if available
-            docstring = ""
-            prev_sibling = func_node.prev_sibling
-            if prev_sibling and prev_sibling.type == 'comment':
-                docstring = self._extract_text_from_node(code_bytes, prev_sibling)
-            
-            functions.append({
-                'name': function_name,
-                'signature': signature,
-                'docstring': docstring,
-                'body': full_function,
-                'start_line': func_node.start_point[0] + 1,
-                'end_line': func_node.end_point[0] + 1
-            })
-        
-        return functions
-    
-    def _extract_classes_from_js_ts(self, code_bytes: bytes, root_node) -> List[Dict[str, Any]]:
-        """
-        Extract classes from a JavaScript/TypeScript AST.
-        
-        Args:
-            code_bytes: Source code as bytes
-            root_node: Root node of the AST
-            
-        Returns:
-            List of class information dictionaries
-        """
-        classes = []
-        query_string = """
-        (class_declaration
-          name: (identifier) @class_name
-          body: (class_body) @body) @class_decl
-          
-        (class
-          name: (identifier) @class_name
-          body: (class_body) @body) @class_expr
-        """
-        
-        lang = 'javascript'
-        if 'typescript' in self.parsers:
-            lang = 'typescript'
-            
-        parser = self.parsers[lang]
-        query = parser.language.query(query_string)
-        captures = query.captures(root_node)
-        
-        # Group captures by class
-        classes_data = {}
-        for capture in captures:
-            node, label = capture
-            
-            if label in ('class_decl', 'class_expr'):
-                if node.id not in classes_data:
-                    classes_data[node.id] = {'node': node}
-            elif label == 'class_name':
-                parent_id = node.parent.id
-                if parent_id in classes_data:
-                    classes_data[parent_id]['name_node'] = node
-            elif label == 'body':
-                parent_id = node.parent.id
-                if parent_id in classes_data:
-                    classes_data[parent_id]['body_node'] = node
-        
-        # Extract class information
-        for class_id, data in classes_data.items():
-            if 'name_node' in data:
-                class_node = data['node']
-                class_name = self._extract_text_from_node(code_bytes, data['name_node'])
-                
-                # Get JSDoc comments if available
-                docstring = ""
-                prev_sibling = class_node.prev_sibling
-                if prev_sibling and prev_sibling.type == 'comment':
-                    docstring = self._extract_text_from_node(code_bytes, prev_sibling)
-                
-                # Extract full class text
-                full_class = self._extract_text_from_node(code_bytes, class_node)
-                
-                classes.append({
-                    'name': class_name,
-                    'docstring': docstring,
-                    'body': full_class,
-                    'start_line': class_node.start_point[0] + 1,
-                    'end_line': class_node.end_point[0] + 1
-                })
-        
-        return classes
-    
-    def _extract_imports_from_js_ts(self, code_bytes: bytes, root_node) -> List[Dict[str, Any]]:
-        """
-        Extract imports from a JavaScript/TypeScript AST.
-        
-        Args:
-            code_bytes: Source code as bytes
-            root_node: Root node of the AST
-            
-        Returns:
-            List of import information dictionaries
-        """
-        imports = []
-        query_string = """
-        (import_statement) @import
-        (import_declaration) @import_decl
-        (export_statement) @export
-        (require_call) @require
-        """
-        
-        lang = 'javascript'
-        if 'typescript' in self.parsers:
-            lang = 'typescript'
-            
-        parser = self.parsers[lang]
-        query = parser.language.query(query_string)
-        captures = query.captures(root_node)
-        
-        for capture in captures:
-            node, _ = capture
-            import_text = self._extract_text_from_node(code_bytes, node)
-            
-            # For require calls, get the full statement
-            if node.type == 'require_call':
-                # Find parent statement
-                parent = node.parent
-                while parent and parent.type != 'expression_statement' and parent.type != 'variable_declaration':
-                    parent = parent.parent
-                
-                if parent:
-                    import_text = self._extract_text_from_node(code_bytes, parent)
-            
-            imports.append({
-                'statement': import_text,
-                'line': node.start_point[0] + 1
-            })
-        
-        return imports
-    
     def _analyze_ast(self, file_path: str, content: str, language: str) -> Dict[str, Any]:
         """
-        Analyze the AST of a file.
+        Analyze the file content to extract functions, classes, and imports.
         
         Args:
             file_path: Path to the file
@@ -622,6 +127,7 @@ class ASTAnalyzer:
         Returns:
             Dictionary containing functions, classes, and imports
         """
+        # Always use the fallback method for simplicity
         result = {
             'path': file_path,
             'language': language,
@@ -630,44 +136,19 @@ class ASTAnalyzer:
             'imports': [],
         }
         
-        if not TREE_SITTER_AVAILABLE or language not in self.parsers:
-            return result
-        
         try:
-            # Parse file content
-            parser = self.parsers[language]
-            code_bytes = content.encode('utf-8')
-            tree = parser.parse(code_bytes)
-            
-            # Extract information based on language
-            if language == 'python':
-                result['functions'] = self._extract_functions_from_python(code_bytes, tree.root_node)
-                result['classes'] = self._extract_classes_from_python(code_bytes, tree.root_node)
-                result['imports'] = self._extract_imports_from_python(code_bytes, tree.root_node)
-            elif language in ('javascript', 'typescript'):
-                result['functions'] = self._extract_functions_from_js_ts(code_bytes, tree.root_node)
-                result['classes'] = self._extract_classes_from_js_ts(code_bytes, tree.root_node)
-                result['imports'] = self._extract_imports_from_js_ts(code_bytes, tree.root_node)
-            # Add more language handlers here
-            
-            # Verify that extraction was successful
-            if not result['functions'] and not result['classes'] and not result['imports']:
-                # Fallback for unsupported language features
-                logger.warning(f"No AST information extracted for {file_path}. Using fallback.")
-                fallback_result = self._fallback_analyze(content, language)
-                result.update(fallback_result)
-                
-        except Exception as e:
-            logger.error(f"Error analyzing AST for {file_path}: {str(e)}")
-            # Use fallback
+            # Use fallback analysis directly
             fallback_result = self._fallback_analyze(content, language)
             result.update(fallback_result)
+                
+        except Exception as e:
+            logger.error(f"Error analyzing {file_path}: {str(e)}")
         
         return result
     
     def _fallback_analyze(self, content: str, language: str) -> Dict[str, Any]:
         """
-        Perform a basic analysis using regex-like pattern matching.
+        Perform a basic analysis using regex patterns.
         Used when tree-sitter is unavailable or fails.
         
         Args:
@@ -826,7 +307,7 @@ class ASTAnalyzer:
         Returns:
             Dictionary containing AST analysis results
         """
-        logger.info(f"Analyzing repository AST in {self.repository_dir}")
+        logger.info(f"Analyzing repository code in {self.repository_dir}")
         
         # Load repository data
         repo_data = self._load_repository_data()
@@ -836,14 +317,10 @@ class ASTAnalyzer:
         all_classes = []
         all_imports = []
         
-        # Check if tree-sitter is available
-        if not TREE_SITTER_AVAILABLE:
-            logger.warning("Tree-sitter is not available. Using fallback analysis.")
-        
         # Process each file
-        for file_entry in tqdm(repo_data['files'], desc="Analyzing AST"):
+        for file_entry in tqdm(repo_data['files'], desc="Analyzing code structures"):
             file_path = file_entry['metadata']['path']
-            content = file_entry['content']
+            content = file_entry.get('content', '')
             
             # Get language for file
             language = self._get_language_for_file(file_path)
@@ -853,7 +330,7 @@ class ASTAnalyzer:
                 continue
             
             # Analyze file
-            logger.debug(f"Analyzing AST for {file_path} ({language})")
+            logger.debug(f"Analyzing {file_path} ({language})")
             result = self._analyze_ast(file_path, content, language)
             
             # Add path to each item
@@ -880,12 +357,74 @@ class ASTAnalyzer:
             'import_count': len(all_imports)
         }
         
-        # Save AST data
+        # Save AST data locally
         self._save_ast_data(ast_data)
         
-        logger.info(f"AST analysis complete: {len(all_functions)} functions, {len(all_classes)} classes, {len(all_imports)} imports")
+        # Try to store in database
+        try:
+            from core.enhanced_db import get_db
+            db = get_db()
+            
+            if db and db.is_available():
+                # Get repository ID
+                repo_id = None
+                repo_meta_path = os.path.join(self.repository_dir, 'repository_metadata.json')
+                
+                if os.path.exists(repo_meta_path):
+                    with open(repo_meta_path, 'r') as f:
+                        repo_meta = json.load(f)
+                        repo_id = repo_meta.get('id')
+                
+                if not repo_id:
+                    logger.warning("Repository ID not found, cannot store AST data in database")
+                else:
+                    # Store AST data in the database
+                    logger.info(f"Storing AST data in database for repository {repo_id}")
+                    try:
+                        success = db.store_ast_data(repo_id, ast_data)
+                        
+                        if success:
+                            logger.info("AST data successfully stored in database")
+                        else:
+                            logger.warning("Failed to store AST data in database")
+                    except Exception as e:
+                        logger.error(f"Error storing AST data: {str(e)}", exc_info=True)
+                        logger.warning("Continuing with local AST data only")
+            else:
+                logger.warning("Database not available, AST data stored locally only")
+        except Exception as e:
+            logger.error(f"Error storing AST data in database: {e}")
+            logger.info("AST data stored locally only")
+        
+        logger.info(f"Code analysis complete: {len(all_functions)} functions, {len(all_classes)} classes, {len(all_imports)} imports")
         
         return ast_data
+
+
+class RepositoryASTAnalyzer(ASTAnalyzer):
+    """
+    Extension of ASTAnalyzer for use with the repository ingest process.
+    This class maintains compatibility with the expected interface in ingest.py.
+    """
+    
+    def __init__(self, repository_dir: str):
+        """
+        Initialize the repository AST analyzer.
+        
+        Args:
+            repository_dir: Directory containing repository data (.promptpilot folder)
+        """
+        super().__init__(repository_dir)
+    
+    def analyze(self) -> Dict[str, Any]:
+        """
+        Analyze the repository and generate AST data.
+        This method is the expected interface for ingest.py.
+        
+        Returns:
+            Dictionary containing AST analysis results
+        """
+        return self.analyze_repository()
 
 
 if __name__ == "__main__":

@@ -1,26 +1,37 @@
-# Core dependencies
+# Core Dependencies
 python-dotenv>=1.0.0
-numpy>=1.24.0
+numpy>=1.24.3
 openai>=1.3.0
 tqdm>=4.66.0
 gitpython>=3.1.40
-google-generativeai>=0.3.1
+google-generativeai>=0.7.0
+click>=8.1.0
+sgqlc[requests]>=16.0  # Include the request transport for complete functionality
+requests>=2.31.0
+
+# Supabase
+supabase>=2.4.0
+storage3>=0.5.4
+
+# Optional - AST Analysis
+# If tree-sitter installation fails, install from GitHub:
+# pip install git+https://github.com/grantjenks/py-tree-sitter-languages.git
 tree-sitter>=0.20.1
+# tree-sitter-languages>=1.7.0  # Uncomment if you can install it
+
+# Install individual language parsers if needed:
+# pip install tree-sitter-python tree-sitter-javascript
 
 # Code parsing and analysis
-tree-sitter-languages>=1.7.0
 pydantic>=2.4.0
 jinja2>=3.1.2
 
 # Supabase integration
-supabase>=2.0.0
 postgrest>=0.11.0
-storage3>=0.6.0
 pgvector-python>=0.2.3
 
 # Additional utilities
 python-dateutil>=2.8.2
-requests>=2.31.0
 urllib3>=2.0.7
 aiohttp>=3.8.6
 tenacity>=8.2.3
